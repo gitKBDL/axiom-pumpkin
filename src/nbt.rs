@@ -212,6 +212,45 @@ mod tests {
         }
     }
 
+    /// A tag has to be measured exactly, or every field after it in the packet is
+    /// read from the wrong offset.
+    #[test]
+    fn measures_a_nested_tag_exactly() {
+        use crate::buf::Reader;
+
+        // Compound { "a": Int 1, "l": List<String>["hi"], "b": ByteArray[2] }
+        let tag: Vec<u8> = vec![
+            10, // compound
+            3, 0, 1, b'a', 0, 0, 0, 1, // int "a" = 1
+            9, 0, 1, b'l', 8, 0, 0, 0, 1, 0, 2, b'h', b'i', // list "l" of one string
+            7, 0, 1, b'b', 0, 0, 0, 2, 9, 9, // byte array "b" of two bytes
+            0,  // end of compound
+        ];
+        let mut trailing = tag.clone();
+        trailing.extend_from_slice(b"AFTER");
+
+        let mut r = Reader::new(&trailing);
+        assert_eq!(take_network_tag(&mut r), Ok(tag.as_slice()));
+        assert_eq!(r.rest(), b"AFTER");
+    }
+
+    #[test]
+    fn an_absent_tag_is_a_single_byte() {
+        use crate::buf::Reader;
+        let mut r = Reader::new(&[0, 42]);
+        assert_eq!(take_network_tag(&mut r), Ok(&[0_u8][..]));
+        assert_eq!(r.rest(), &[42]);
+    }
+
+    #[test]
+    fn a_truncated_tag_is_rejected() {
+        use crate::buf::Reader;
+        // Claims an int payload but supplies two bytes of it.
+        assert!(take_network_tag(&mut Reader::new(&[10, 3, 0, 1, b'a', 0, 0])).is_err());
+        // Unknown tag type.
+        assert!(take_network_tag(&mut Reader::new(&[99])).is_err());
+    }
+
     /// And the decompressor we use for inbound data must accept them too, since
     /// that is the path a round trip through the client would take.
     #[test]
@@ -220,4 +259,100 @@ mod tests {
         let frame = compress_raw(&payload);
         assert_eq!(decompress(&frame, payload.len()), Ok(payload));
     }
+}
+
+/// Maximum nesting a tag may use. Vanilla stops at 512; the point is only to keep
+/// a hostile packet from recursing until the stack gives out.
+const MAX_DEPTH: u32 = 512;
+
+/// Consumes one network-form NBT value — a type byte followed by its payload, with
+/// no root name — and returns the bytes it spanned.
+///
+/// Axiom embeds these in the middle of packets, so the only way to reach the next
+/// field is to walk the tag and find where it ends.
+pub fn take_network_tag<'a>(r: &mut crate::buf::Reader<'a>) -> crate::buf::Result<&'a [u8]> {
+    let start = r.position();
+    let tag = r.u8()?;
+    if tag != 0 {
+        skip_payload(r, tag, 0)?;
+    }
+    r.since(start)
+}
+
+fn skip_payload(r: &mut crate::buf::Reader<'_>, tag: u8, depth: u32) -> crate::buf::Result<()> {
+    use crate::buf::Error;
+
+    if depth > MAX_DEPTH {
+        return Err(Error::TooLarge {
+            what: "nbt nesting",
+            len: depth as usize,
+            max: MAX_DEPTH as usize,
+        });
+    }
+    match tag {
+        0 => {}
+        1 => {
+            r.take(1)?;
+        }
+        2 => {
+            r.take(2)?;
+        }
+        3 | 5 => {
+            r.take(4)?;
+        }
+        4 | 6 => {
+            r.take(8)?;
+        }
+        7 | 11 | 12 => {
+            let width = if tag == 7 {
+                1
+            } else if tag == 11 {
+                4
+            } else {
+                8
+            };
+            let len = array_len(r)?;
+            r.take(len.checked_mul(width).ok_or(Error::Eof)?)?;
+        }
+        8 => {
+            let len = usize::from(r.u16()?);
+            r.take(len)?;
+        }
+        9 => {
+            let element = r.u8()?;
+            let len = array_len(r)?;
+            // A list of TAG_End carries no payload regardless of its length.
+            if element != 0 {
+                for _ in 0..len {
+                    skip_payload(r, element, depth + 1)?;
+                }
+            }
+        }
+        10 => loop {
+            let entry = r.u8()?;
+            if entry == 0 {
+                break;
+            }
+            let name_len = usize::from(r.u16()?);
+            r.take(name_len)?;
+            skip_payload(r, entry, depth + 1)?;
+        },
+        other => {
+            return Err(Error::TooLarge {
+                what: "nbt tag type",
+                len: other as usize,
+                max: 12,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn array_len(r: &mut crate::buf::Reader<'_>) -> crate::buf::Result<usize> {
+    let raw = r.i32()?;
+    usize::try_from(raw).map_err(|_| crate::buf::Error::TooLarge {
+        what: "nbt array length",
+        len: 0,
+        max: i32::MAX as usize,
+    })
 }

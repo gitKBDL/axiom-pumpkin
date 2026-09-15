@@ -201,6 +201,16 @@ impl<'a> Reader<'a> {
     pub fn peek_u8(&self) -> Result<u8> {
         self.data.get(self.pos).copied().ok_or(Error::Eof)
     }
+
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Everything between `start` and the current position.
+    pub fn since(&self, start: usize) -> Result<&'a [u8]> {
+        self.data.get(start..self.pos).ok_or(Error::Eof)
+    }
 }
 
 /// Vanilla packs a block position into a long as 26 bits of X, 26 of Z and 12 of Y,
