@@ -1,0 +1,26 @@
+[package]
+name = "axiom-pumpkin"
+version = "0.1.0"
+edition = "2024"
+description = "Serverside component for Axiom on PumpkinMC"
+license = "GPL-3.0"
+
+# Standalone: do not get adopted into a parent workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pumpkin-plugin-api = { path = "../pumpkin-src/crates/pumpkin-plugin-api" }
+# Pure-Rust zstd decoder. The C `zstd` crate would need a wasi-sdk C toolchain;
+# we only ever decompress inbound frames, and reply uncompressed.
+ruzstd = "0.7"
+getrandom = "0.3"
+# Forwarded to the server console by the plugin API's tracing subscriber.
+tracing = "0.1"
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = "debuginfo"

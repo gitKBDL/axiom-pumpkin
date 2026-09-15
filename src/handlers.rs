@@ -1,0 +1,387 @@
+//! Serverbound packet handlers.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use pumpkin_plugin_api::{
+    common::BlockPos,
+    java_packets::{CAcknowledgeBlockChange, ClientboundPacket},
+    player::Player,
+    world::{self, BlockFlags},
+};
+
+use crate::block_remap::{self, Run};
+use crate::buf::{Reader, pack_block_pos, unpack_block_pos};
+use crate::palette::{self, SECTION_VOLUME, index_of};
+use crate::permissions;
+use crate::proto::{consume_dispatch_sends, has_perm};
+
+/// Upstream's default `packetCollectionReadLimit`, which bounds how many entries a
+/// single packet may declare before we start allocating for them.
+const MAX_COLLECTION: usize = 1024;
+
+/// A block buffer is terminated by this sentinel key rather than a count.
+const MIN_POSITION_LONG: i64 = pack_block_pos(-33_554_432, -2048, -33_554_432);
+
+/// Upstream caps a section at one block entity per block.
+const MAX_BLOCK_ENTITIES: usize = SECTION_VOLUME;
+
+/// A single compressed block entity; generous, since these are NBT blobs.
+const MAX_BLOCK_ENTITY_BYTES: usize = 1 << 20;
+
+/// Cached `get_block_state_count`; 0 means "not looked up yet".
+static STATE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Cached id of `minecraft:void_air`, which a block buffer uses to mean
+/// "leave this block alone"; `u16::MAX` means "not looked up yet".
+static VOID_AIR: AtomicU32 = AtomicU32::new(u32::MAX);
+
+fn state_count() -> u32 {
+    let mut count = STATE_COUNT.load(Ordering::Relaxed);
+    if count == 0 {
+        count = world::get_block_state_count();
+        STATE_COUNT.store(count, Ordering::Relaxed);
+    }
+    count
+}
+
+/// Width of the server's global palette, which is what a direct-palette section
+/// in a block buffer is packed at.
+fn direct_bits() -> u8 {
+    let count = state_count().max(2);
+    (u32::BITS - (count - 1).leading_zeros()) as u8
+}
+
+fn void_air() -> u16 {
+    let cached = VOID_AIR.load(Ordering::Relaxed);
+    if cached != u32::MAX {
+        return cached as u16;
+    }
+    // Absent void_air the buffer has no "unchanged" marker, so fall back to an id
+    // no section can contain rather than silently overwriting the world with air.
+    let id = world::resolve_block_state("minecraft:void_air", &[]).unwrap_or(u16::MAX);
+    VOID_AIR.store(u32::from(id), Ordering::Relaxed);
+    id
+}
+
+/// The id translation this client needs, if any.
+///
+/// Pumpkin serves clients older than its own version and remaps block state ids in
+/// the chunk data it sends, but plugin messages pass through untouched — so an
+/// older client's Axiom packets arrive in *its* registry, where the same number
+/// means a different block. Upstream leans on ViaVersion for exactly this.
+fn client_remap(player: &Player) -> Option<&'static [Run]> {
+    player
+        .as_java()
+        .and_then(|java| block_remap::table_for(java.get_version()))
+}
+
+/// Human-readable note about whether this client's block ids need translating.
+pub fn describe_client_registry(player: &Player) -> String {
+    let Some(java) = player.as_java() else {
+        return "not a Java client".to_owned();
+    };
+    let version = java.get_version();
+    if block_remap::table_for(version).is_some() {
+        format!("client {version:?}, translating block ids to the server registry")
+    } else {
+        format!("client {version:?}, same block registry as the server")
+    }
+}
+
+/// Converts one id from the client's registry into the server's and checks it.
+///
+/// `None` means the id has no equivalent here; callers treat that as "leave this
+/// block alone", which is the only safe reading — guessing a replacement would
+/// silently rewrite the player's build.
+fn server_state(remap: Option<&'static [Run]>, client_id: u16) -> Option<u16> {
+    let id = match remap {
+        Some(table) => block_remap::to_server(table, client_id)?,
+        None => client_id,
+    };
+    (u32::from(id) < state_count()).then_some(id)
+}
+
+/// Flags matching Axiom's two placement modes.
+fn placement_flags(update_neighbors: bool) -> BlockFlags {
+    if update_neighbors {
+        BlockFlags::NOTIFY_NEIGHBORS | BlockFlags::NOTIFY_LISTENERS
+    } else {
+        // Axiom's "no updates" capability: the state lands exactly as sent, without
+        // the placement callbacks that would pop a torch off a wall or reshape a
+        // fence. `NOTIFY_LISTENERS` still queues the change for nearby clients.
+        // `MOVED` is what actually suppresses the neighbour shape pass; without it
+        // Pumpkin reshapes neighbours even with NOTIFY_NEIGHBORS cleared. Lighting
+        // is refreshed regardless of flags, so it stays correct either way.
+        BlockFlags::NOTIFY_LISTENERS
+            | BlockFlags::MOVED
+            | BlockFlags::SKIP_BLOCK_ADDED_CALLBACK
+            | BlockFlags::SKIP_BLOCK_ENTITY_REPLACED_CALLBACK
+    }
+}
+
+/// `axiom:set_block` — a handful of individual placements, as produced by the
+/// regular place/break tools rather than a brush.
+pub fn set_block(player: &Player, body: &[u8]) -> Result<(), String> {
+    let mut r = Reader::new(body);
+    let err = |e: crate::buf::Error| e.to_string();
+
+    let count = r.var_len("block map", MAX_COLLECTION).map_err(err)?;
+    let mut blocks = Vec::with_capacity(count);
+    for _ in 0..count {
+        let pos = r.block_pos().map_err(err)?;
+        let state = r.var_i32().map_err(err)?;
+        blocks.push((pos, state));
+    }
+
+    let update_neighbors = r.bool().map_err(err)?;
+    let mut prevent_updates_at = Vec::new();
+    if update_neighbors {
+        let n = r.var_len("prevent-updates set", MAX_COLLECTION).map_err(err)?;
+        prevent_updates_at.reserve(n);
+        for _ in 0..n {
+            prevent_updates_at.push(r.block_pos().map_err(err)?);
+        }
+    }
+
+    let _reason = r.var_i32().map_err(err)?;
+    let _breaking = r.bool().map_err(err)?;
+    // BlockHitResult: position, face, the three hit offsets, then "inside block".
+    let _hit_pos = r.block_pos().map_err(err)?;
+    let _hit_face = r.var_i32().map_err(err)?;
+    let _hit_x = r.f32().map_err(err)?;
+    let _hit_y = r.f32().map_err(err)?;
+    let _hit_z = r.f32().map_err(err)?;
+    let _inside = r.bool().map_err(err)?;
+    let _hand = r.var_i32().map_err(err)?;
+    let sequence_id = r.var_i32().map_err(err)?;
+
+    // The client predicts its own placements and rolls them back unless the
+    // sequence is acknowledged, so this has to happen even if we place nothing.
+    if sequence_id >= 0
+        && let Some(java) = player.as_java()
+    {
+        java.send_packet(&ClientboundPacket::CAcknowledgeBlockChange(
+            CAcknowledgeBlockChange { sequence_id },
+        ));
+    }
+
+    if !has_perm(player, permissions::BUILD_PLACE) {
+        return Ok(());
+    }
+
+    let world = player.get_world();
+    let remap = client_remap(player);
+    for ((x, y, z), state) in blocks {
+        let Some(state) = u16::try_from(state).ok().and_then(|id| server_state(remap, id)) else {
+            continue;
+        };
+        // Upstream skips neighbour updates for a block adjacent to any position the
+        // client asked to leave alone, so a no-update placement cannot be undone by
+        // its neighbour's update.
+        let near_protected = prevent_updates_at.iter().any(|&(px, py, pz)| {
+            (px - x).abs() + (py - y).abs() + (pz - z).abs() <= 1
+        });
+        world.set_block_state(
+            BlockPos { x, y, z },
+            state,
+            placement_flags(update_neighbors && !near_protected),
+        );
+    }
+    Ok(())
+}
+
+/// Logs what the first buffer actually contains, once per server start.
+///
+/// The "leave this alone" marker is a registry id agreed on implicitly between
+/// client and server; if the two disagree, every untouched block in the edited
+/// volume gets overwritten and nothing else in the pipeline complains.
+static DIAGNOSED: AtomicU32 = AtomicU32::new(0);
+
+fn describe(id: u16) -> String {
+    world::block_state_to_info(id).map_or_else(
+        || format!("{id} (unknown)"),
+        |info| format!("{id} ({})", info.name),
+    )
+}
+
+fn diagnose_first_section(remap: Option<&'static [Run]>, declared_bits: u8, entries: &[u16]) {
+    if DIAGNOSED.swap(1, Ordering::Relaxed) != 0 {
+        return;
+    }
+    let mut counts: Vec<(u16, usize)> = Vec::new();
+    for &id in entries {
+        match counts.iter_mut().find(|(seen, _)| *seen == id) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((id, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    // Report ids as the server sees them; the raw wire value is in the client's
+    // registry and naming it with our own table is how this looked like a
+    // turtle_egg problem the first time round.
+    let top: Vec<String> = counts
+        .iter()
+        .take(3)
+        .map(|(id, n)| match server_state(remap, *id) {
+            Some(server) => format!("{}×{n}", describe(server)),
+            None => format!("{id} (no server equivalent)×{n}"),
+        })
+        .collect();
+
+    tracing::info!(
+        "Axiom buffer diagnostics: state_count={}, direct_bits={}, empty marker={}, \
+         section declared {declared_bits} bits, {} distinct ids, most common: {}",
+        state_count(),
+        direct_bits(),
+        describe(void_air()),
+        counts.len(),
+        top.join(", "),
+    );
+}
+
+/// Compares a dimension id off the wire with the server's, tolerating an implicit
+/// `minecraft:` namespace on either side.
+fn same_dimension(a: &str, b: &str) -> bool {
+    fn bare(s: &str) -> &str {
+        s.strip_prefix("minecraft:").unwrap_or(s)
+    }
+    bare(a) == bare(b)
+}
+
+/// `axiom:set_buffer` — whole chunk sections at a time, as produced by brushes,
+/// shapes and pastes. Blocks left as `void_air` in the buffer are untouched.
+pub fn set_buffer(player: &Player, body: &[u8]) -> Result<(), String> {
+    let mut r = Reader::new(body);
+    let err = |e: crate::buf::Error| e.to_string();
+
+    // Dimension the client believes it is editing, then a buffer id we do not need.
+    let world_key = r.string().map_err(err)?.to_owned();
+    let _buffer_id = r.uuid().map_err(err)?;
+
+    match r.u8().map_err(err)? {
+        0 => apply_block_buffer(player, &mut r, &world_key),
+        // Biome buffers need a per-section biome write, which the plugin API does
+        // not expose yet; dropping them leaves blocks working.
+        1 => Ok(()),
+        other => Err(format!("unknown buffer type: {other}")),
+    }
+}
+
+fn apply_block_buffer(player: &Player, r: &mut Reader<'_>, world_key: &str) -> Result<(), String> {
+    let err = |e: crate::buf::Error| e.to_string();
+
+    if !has_perm(player, permissions::BUILD_SECTION) {
+        return Ok(());
+    }
+    let world = player.get_world();
+    let dimension = world.get_dimension();
+    if !same_dimension(&dimension, world_key) {
+        // Normally means the player changed dimension while the buffer was in
+        // flight. Logged because the alternative cause — an id spelled differently
+        // on either side — would otherwise look like edits silently doing nothing.
+        tracing::warn!("Dropping block buffer for {world_key}; player is in {dimension}");
+        return Ok(());
+    }
+
+    let empty = void_air();
+    let remap = client_remap(player);
+    let direct = direct_bits();
+    let flags = placement_flags(false);
+    let mut sections = 0_usize;
+    let mut changed = 0_usize;
+
+    loop {
+        let key = r.i64().map_err(err)?;
+        if key == MIN_POSITION_LONG {
+            break;
+        }
+        let (section_x, section_y, section_z) = unpack_block_pos(key);
+        let declared_bits = r.peek_u8().map_err(err)?;
+        let entries = palette::read_section(r, direct).map_err(err)?;
+        diagnose_first_section(remap, declared_bits, &entries);
+
+        // Block entity NBT is zstd-compressed with a trained dictionary; until that
+        // is wired up, skip the payload so the reader stays aligned.
+        let block_entities = r
+            .var_len("block entities", MAX_BLOCK_ENTITIES)
+            .map_err(err)?;
+        for _ in 0..block_entities {
+            let _offset = r.i16().map_err(err)?;
+            let _original_size = r.var_i32().map_err(err)?;
+            let _dictionary = r.u8().map_err(err)?;
+            let _compressed = r.byte_array(MAX_BLOCK_ENTITY_BYTES).map_err(err)?;
+        }
+
+        let base_x = section_x * 16;
+        let base_y = section_y * 16;
+        let base_z = section_z * 16;
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let Some(state) = server_state(remap, entries[index_of(x, y, z)]) else {
+                        continue;
+                    };
+                    if state == empty {
+                        continue;
+                    }
+                    world.set_block_state(
+                        BlockPos {
+                            x: base_x + x as i32,
+                            y: base_y + y as i32,
+                            z: base_z + z as i32,
+                        },
+                        state,
+                        flags,
+                    );
+                    changed += 1;
+                }
+            }
+        }
+        sections += 1;
+    }
+
+    // The client spends its own copy of this budget before sending; if the server
+    // never reconciles and tops it up, the client goes quiet after one buffer.
+    let client_available = r.var_i32().unwrap_or(0);
+    let within_limit = consume_dispatch_sends(
+        player,
+        i32::try_from(sections).unwrap_or(i32::MAX),
+        client_available,
+    );
+
+    tracing::debug!(
+        "Applied {changed} blocks across {sections} sections for {}",
+        player.get_name()
+    );
+
+    if within_limit {
+        Ok(())
+    } else {
+        Err("you are sending updates too fast".to_owned())
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block_remap::{table_for, to_server};
+    use pumpkin_plugin_api::player::JavaMinecraftVersion;
+
+    /// Regression: a 1.21.9 client calls `void_air` 15090 while the 26.2 server
+    /// calls it 15292. Reading that id literally made every block a buffer meant
+    /// to leave untouched get overwritten.
+    #[test]
+    fn older_client_ids_translate_to_the_server_registry() {
+        let table = table_for(JavaMinecraftVersion::V1219).expect("1.21.9 needs translation");
+        assert_eq!(to_server(table, 15090), Some(15292), "void_air");
+        assert_eq!(to_server(table, 1), Some(1), "stone is unchanged");
+        assert_eq!(to_server(table, 0), Some(0), "air is unchanged");
+    }
+
+    /// A client on the server's own version must not be translated at all.
+    #[test]
+    fn current_version_needs_no_translation() {
+        assert!(table_for(JavaMinecraftVersion::V262).is_none());
+    }
+}
