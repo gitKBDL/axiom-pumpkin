@@ -6,11 +6,12 @@ use pumpkin_plugin_api::{
     common::BlockPos,
     java_packets::{CAcknowledgeBlockChange, ClientboundPacket},
     player::Player,
-    world::{self, BlockFlags},
+    world::{self, BlockFlags, World},
 };
 
 use crate::block_remap::{self, Run};
 use crate::buf::{Reader, pack_block_pos, unpack_block_pos};
+use crate::nbt;
 use crate::palette::{self, SECTION_VOLUME, index_of};
 use crate::permissions;
 use crate::proto::{consume_dispatch_sends, has_perm};
@@ -27,6 +28,51 @@ const MAX_BLOCK_ENTITIES: usize = SECTION_VOLUME;
 
 /// A single compressed block entity; generous, since these are NBT blobs.
 const MAX_BLOCK_ENTITY_BYTES: usize = 1 << 20;
+
+/// Total decompressed block entity NBT allowed per buffer. Each blob is bounded
+/// on its own, but a buffer full of tiny blobs that each expand to the per-blob
+/// ceiling would still be a decompression bomb.
+const MAX_BUFFER_NBT_BYTES: usize = 32 << 20;
+
+/// A block entity waiting for its block to be placed. The compressed payload is
+/// borrowed from the packet rather than copied, since most of them are dropped:
+/// a section carries entities for blocks the buffer may leave untouched.
+struct PendingBlockEntity<'a> {
+    /// Position within the section, packed as `x | y << 4 | z << 8` — note this
+    /// is not the order the block palette uses.
+    offset: u16,
+    original_size: usize,
+    dictionary: u8,
+    compressed: &'a [u8],
+}
+
+fn apply_block_entity(
+    world: &World,
+    pos: BlockPos,
+    entity: &PendingBlockEntity<'_>,
+    budget: &mut usize,
+) {
+    if entity.dictionary != nbt::SUPPORTED_DICTIONARY {
+        tracing::debug!("Skipping block entity with dictionary {}", entity.dictionary);
+        return;
+    }
+    if entity.original_size > *budget {
+        return;
+    }
+    *budget -= entity.original_size;
+
+    match nbt::decompress(entity.compressed, entity.original_size) {
+        Ok(named) => match nbt::to_unnamed_root(&named) {
+            Some(unnamed) => {
+                if let Err(e) = world.set_block_entity_nbt(pos, &unnamed) {
+                    tracing::debug!("Block entity at {pos:?} rejected: {e}");
+                }
+            }
+            None => tracing::debug!("Block entity at {pos:?} is not an NBT compound"),
+        },
+        Err(e) => tracing::debug!("Block entity at {pos:?} failed to decompress: {e}"),
+    }
+}
 
 /// Cached `get_block_state_count`; 0 means "not looked up yet".
 static STATE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -267,7 +313,11 @@ pub fn set_buffer(player: &Player, body: &[u8]) -> Result<(), String> {
     }
 }
 
-fn apply_block_buffer(player: &Player, r: &mut Reader<'_>, world_key: &str) -> Result<(), String> {
+fn apply_block_buffer<'a>(
+    player: &Player,
+    r: &mut Reader<'a>,
+    world_key: &str,
+) -> Result<(), String> {
     let err = |e: crate::buf::Error| e.to_string();
 
     if !has_perm(player, permissions::BUILD_SECTION) {
@@ -287,6 +337,8 @@ fn apply_block_buffer(player: &Player, r: &mut Reader<'_>, world_key: &str) -> R
     let remap = client_remap(player);
     let direct = direct_bits();
     let flags = placement_flags(false);
+    let allow_nbt = has_perm(player, permissions::BUILD_NBT);
+    let mut nbt_budget = MAX_BUFFER_NBT_BYTES;
     let mut sections = 0_usize;
     let mut changed = 0_usize;
 
@@ -300,17 +352,27 @@ fn apply_block_buffer(player: &Player, r: &mut Reader<'_>, world_key: &str) -> R
         let entries = palette::read_section(r, direct).map_err(err)?;
         diagnose_first_section(remap, declared_bits, &entries);
 
-        // Block entity NBT is zstd-compressed with a trained dictionary; until that
-        // is wired up, skip the payload so the reader stays aligned.
-        let block_entities = r
+        let count = r
             .var_len("block entities", MAX_BLOCK_ENTITIES)
             .map_err(err)?;
-        for _ in 0..block_entities {
-            let _offset = r.i16().map_err(err)?;
-            let _original_size = r.var_i32().map_err(err)?;
-            let _dictionary = r.u8().map_err(err)?;
-            let _compressed = r.byte_array(MAX_BLOCK_ENTITY_BYTES).map_err(err)?;
+        let mut entities: Vec<PendingBlockEntity<'a>> = Vec::new();
+        for _ in 0..count {
+            let offset = r.i16().map_err(err)? as u16;
+            let original_size = r
+                .var_len("block entity NBT", nbt::MAX_DECOMPRESSED)
+                .map_err(err)?;
+            let dictionary = r.u8().map_err(err)?;
+            let compressed = r.byte_array(MAX_BLOCK_ENTITY_BYTES).map_err(err)?;
+            if allow_nbt {
+                entities.push(PendingBlockEntity {
+                    offset,
+                    original_size,
+                    dictionary,
+                    compressed,
+                });
+            }
         }
+        entities.sort_unstable_by_key(|entity| entity.offset);
 
         let base_x = section_x * 16;
         let base_y = section_y * 16;
@@ -324,16 +386,22 @@ fn apply_block_buffer(player: &Player, r: &mut Reader<'_>, world_key: &str) -> R
                     if state == empty {
                         continue;
                     }
-                    world.set_block_state(
-                        BlockPos {
-                            x: base_x + x as i32,
-                            y: base_y + y as i32,
-                            z: base_z + z as i32,
-                        },
-                        state,
-                        flags,
-                    );
+                    let pos = BlockPos {
+                        x: base_x + x as i32,
+                        y: base_y + y as i32,
+                        z: base_z + z as i32,
+                    };
+                    world.set_block_state(pos, state, flags);
                     changed += 1;
+
+                    if !entities.is_empty() {
+                        let offset = (x | (y << 4) | (z << 8)) as u16;
+                        if let Ok(found) =
+                            entities.binary_search_by_key(&offset, |entity| entity.offset)
+                        {
+                            apply_block_entity(&world, pos, &entities[found], &mut nbt_budget);
+                        }
+                    }
                 }
             }
         }

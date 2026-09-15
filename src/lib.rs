@@ -8,6 +8,7 @@
 mod block_remap;
 mod buf;
 mod handlers;
+mod nbt;
 mod palette;
 mod permissions;
 mod proto;
