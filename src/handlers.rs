@@ -7,6 +7,7 @@ use pumpkin_plugin_api::{
     common::{BlockPos, GameMode},
     java_packets::{CAcknowledgeBlockChange, ClientboundPacket},
     player::Player,
+    text::TextComponent,
     world::{self, BlockFlags, Chunk, Entity, EntityType, World},
 };
 
@@ -1048,4 +1049,102 @@ enum PassengerChange {
     RemoveAll,
     Add(Vec<(u64, u64)>),
     Remove(Vec<(u64, u64)>),
+}
+
+/// Blocks a single tick request may touch. Upstream lets these run to millions and
+/// warns that the server will lag; here each block is a host call, so the same
+/// request would stall the tick for far longer. Truncating and saying so beats
+/// freezing the server.
+const MAX_TICKED_BLOCKS: usize = 65_536;
+
+/// `axiom:tick_blocks` — re-run block updates over a selection, which is what
+/// settles fluids and attached blocks after a paste.
+pub fn tick_blocks(player: &Player, body: &[u8]) -> Result<(), String> {
+    let mut r = Reader::new(body);
+    let err = |e: crate::buf::Error| e.to_string();
+
+    let dimension = r.string().map_err(err)?.to_owned();
+    let mut positions: Vec<(i32, i32, i32)> = Vec::new();
+    let mut requested = 0_usize;
+
+    match r.u8().map_err(err)? {
+        0 => {
+            let sections = r.var_len("position set", MAX_COLLECTION).map_err(err)?;
+            for _ in 0..sections {
+                let (section_x, section_y, section_z) =
+                    unpack_block_pos(r.i64().map_err(err)?);
+                // 256 rows of 16 X bits each, ordered z then y.
+                for index in 0..256_usize {
+                    let mask = r.i16().map_err(err)? as u16;
+                    if mask == 0 {
+                        continue;
+                    }
+                    let (z, y) = (index / 16, index % 16);
+                    for x in 0..16 {
+                        if mask & (1 << x) == 0 {
+                            continue;
+                        }
+                        requested += 1;
+                        if positions.len() < MAX_TICKED_BLOCKS {
+                            positions.push((
+                                section_x * 16 + x,
+                                section_y * 16 + y as i32,
+                                section_z * 16 + z as i32,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        1 => {
+            let (ax, ay, az) = r.block_pos().map_err(err)?;
+            let (bx, by, bz) = r.block_pos().map_err(err)?;
+            for x in ax.min(bx)..=ax.max(bx) {
+                for y in ay.min(by)..=ay.max(by) {
+                    for z in az.min(bz)..=az.max(bz) {
+                        requested += 1;
+                        if positions.len() < MAX_TICKED_BLOCKS {
+                            positions.push((x, y, z));
+                        }
+                    }
+                }
+            }
+        }
+        other => return Err(format!("unknown tick selection type: {other}")),
+    }
+
+    if !has_perm(player, permissions::BUILD_DANGEROUS_TICK) {
+        return Ok(());
+    }
+    let world = player.get_world();
+    if !same_dimension(&world.get_dimension(), &dimension) {
+        return Ok(());
+    }
+
+    // Writing a block back as itself is what runs the neighbour-update machinery;
+    // FORCE_STATE is needed precisely because the state does not change.
+    let flags = BlockFlags::NOTIFY_NEIGHBORS | BlockFlags::NOTIFY_LISTENERS | BlockFlags::FORCE_STATE;
+    for (x, y, z) in &positions {
+        let pos = BlockPos {
+            x: *x,
+            y: *y,
+            z: *z,
+        };
+        let state = world.get_block_state_id(pos);
+        if state != 0 {
+            world.set_block_state(pos, state, flags);
+        }
+    }
+
+    if requested > positions.len() {
+        player.send_system_message(
+            TextComponent::text(&format!(
+                "Axiom: ticked the first {} of {requested} blocks; the rest were skipped to keep the server responsive",
+                positions.len()
+            )),
+            false,
+        );
+    }
+    tracing::debug!("Ticked {} blocks for {}", positions.len(), player.get_name());
+    Ok(())
 }

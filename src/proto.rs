@@ -298,6 +298,7 @@ fn dispatch(server: &Server, player: &Player, id: &str, body: &[u8]) {
         "axiom:delete_entity" => crate::handlers::delete_entity(player, body),
         "axiom:request_entity_data" => crate::handlers::request_entity_data(player, body),
         "axiom:manipulate_entity" => crate::handlers::manipulate_entity(player, body),
+        "axiom:tick_blocks" => crate::handlers::tick_blocks(player, body),
         // Unknown ids arrive whenever the client runs ahead of what this port
         // implements. Upstream kicks; ignoring is friendlier and equally safe,
         // because nothing was applied.
