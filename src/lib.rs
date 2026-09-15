@@ -49,6 +49,7 @@ pub const SUPPORTED_PACKETS: &[&str] = &["axiom:tunnel", "axiom:hello", "axiom:s
     "axiom:request_chunk_data",
     "axiom:delete_entity",
     "axiom:request_entity_data",
+    "axiom:manipulate_entity",
 ];
 
 static PLAYERS: Mutex<Option<HashMap<PlayerKey, PlayerState>>> = Mutex::new(None);

@@ -917,3 +917,135 @@ fn send_entity_data(player: &Player, id: i64, finished: bool, entries: &[(u64, u
     }
     send(player, "axiom:response_entity_data", &w.into_vec());
 }
+
+/// Bits of the movement flag byte marking an axis as relative to where the entity
+/// already is, matching vanilla's `Relative` packing.
+const RELATIVE_X: u8 = 1;
+const RELATIVE_Y: u8 = 1 << 1;
+const RELATIVE_Z: u8 = 1 << 2;
+const RELATIVE_YAW: u8 = 1 << 3;
+const RELATIVE_PITCH: u8 = 1 << 4;
+
+/// `axiom:manipulate_entity` — move, rotate, re-NBT or re-seat existing entities.
+pub fn manipulate_entity(player: &Player, body: &[u8]) -> Result<(), String> {
+    let mut r = Reader::new(body);
+    let err = |e: crate::buf::Error| e.to_string();
+
+    struct Entry<'a> {
+        uuid: (u64, u64),
+        movement: Option<(u8, f64, f64, f64, f32, f32)>,
+        merge: &'a [u8],
+        passengers: PassengerChange,
+    }
+
+    let count = r.var_len("manipulate list", MAX_COLLECTION).map_err(err)?;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let uuid = r.uuid().map_err(err)?;
+        let flags = r.i8().map_err(err)?;
+        // A negative flag byte means "leave the entity where it is".
+        let movement = if flags >= 0 {
+            Some((
+                flags as u8,
+                r.f64().map_err(err)?,
+                r.f64().map_err(err)?,
+                r.f64().map_err(err)?,
+                r.f32().map_err(err)?,
+                r.f32().map_err(err)?,
+            ))
+        } else {
+            None
+        };
+        let merge = nbt::take_network_tag(&mut r).map_err(err)?;
+        let passengers = match r.var_i32().map_err(err)? {
+            0 => PassengerChange::None,
+            1 => PassengerChange::RemoveAll,
+            2 => PassengerChange::Add(read_uuid_list(&mut r)?),
+            3 => PassengerChange::Remove(read_uuid_list(&mut r)?),
+            other => return Err(format!("unknown passenger manipulation: {other}")),
+        };
+        entries.push(Entry {
+            uuid,
+            movement,
+            merge,
+            passengers,
+        });
+    }
+
+    if !has_perm(player, permissions::ENTITY_MANIPULATE) {
+        return Ok(());
+    }
+    let world = player.get_world();
+    let wanted: Vec<(u64, u64)> = entries.iter().map(|entry| entry.uuid).collect();
+    let found = entities_by_uuid(&world, &wanted);
+
+    for (index, entity) in &found {
+        if entity.get_type() == EntityType::Player {
+            continue;
+        }
+        let entry = &entries[*index];
+
+        // An empty tag is a single TAG_End byte and means "no NBT change".
+        // Pumpkin reads only the fields the NBT mentions, which is the merge
+        // upstream builds by hand.
+        if entry.merge.len() > 1
+            && let Err(e) = entity.set_nbt(entry.merge)
+        {
+            tracing::debug!("Entity NBT rejected: {e}");
+        }
+
+        if let Some((flags, x, y, z, yaw, pitch)) = entry.movement {
+            let (cx, cy, cz) = entity.get_position();
+            let relative = |flag: u8, value: f64, current: f64| {
+                if flags & flag == 0 {
+                    value
+                } else {
+                    current + value
+                }
+            };
+            let position = (
+                relative(RELATIVE_X, x, cx),
+                relative(RELATIVE_Y, y, cy),
+                relative(RELATIVE_Z, z, cz),
+            );
+            let yaw = if flags & RELATIVE_YAW == 0 {
+                yaw
+            } else {
+                entity.get_yaw() + yaw
+            };
+            let pitch = if flags & RELATIVE_PITCH == 0 {
+                pitch
+            } else {
+                entity.get_pitch() + pitch
+            };
+            // The resource handle is consumed by the call, so each teleport needs
+            // its own.
+            entity.teleport(position, player.get_world());
+            entity.set_rotation(yaw, pitch);
+        }
+
+        match &entry.passengers {
+            PassengerChange::None => {}
+            PassengerChange::RemoveAll => entity.eject_passengers(),
+            PassengerChange::Add(list) => {
+                for (_, passenger) in entities_by_uuid(&world, list) {
+                    entity.add_passenger(passenger);
+                }
+            }
+            PassengerChange::Remove(list) => {
+                for (_, passenger) in entities_by_uuid(&world, list) {
+                    entity.remove_passenger(passenger);
+                }
+            }
+        }
+    }
+    tracing::debug!("Manipulated {} entities for {}", found.len(), player.get_name());
+    Ok(())
+}
+
+enum PassengerChange {
+    None,
+    RemoveAll,
+    Add(Vec<(u64, u64)>),
+    Remove(Vec<(u64, u64)>),
+}
