@@ -561,6 +561,9 @@ pub fn set_no_physical_trigger(player: &Player, body: &[u8]) -> Result<(), Strin
     Ok(())
 }
 
+/// Above this, answering a chunk request cost more than a server tick.
+const SLOW_REQUEST: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// One clientbound payload may carry a mebibyte; upstream leaves the same leeway.
 const MAX_RESPONSE_BYTES: usize = (1 << 20) - 64;
 
@@ -569,8 +572,66 @@ const MAX_RESPONSE_BYTES: usize = (1 << 20) - 64;
 /// answer is legitimate — upstream also drops sections it cannot reach.
 const MAX_SECTIONS_PER_REQUEST: usize = 128;
 
-/// Above this, answering a chunk request cost more than a server tick.
-const SLOW_REQUEST: std::time::Duration = std::time::Duration::from_millis(50);
+/// Accumulates a chunk data response, splitting it across payloads as it fills.
+///
+/// The wire shape is a block entity list, then a section list, each closed by a
+/// sentinel, then a "finished" flag. A split has to close whichever lists are
+/// still open before sending, and the continuation reopens at the same point —
+/// which is the whole reason this is a type rather than inline code.
+struct ChunkResponse<'a> {
+    player: &'a Player,
+    id: i64,
+    buf: Writer,
+    entities_open: bool,
+}
+
+impl<'a> ChunkResponse<'a> {
+    fn new(player: &'a Player, id: i64) -> Self {
+        let mut buf = Writer::new();
+        buf.i64(id);
+        Self {
+            player,
+            id,
+            buf,
+            entities_open: true,
+        }
+    }
+
+    /// Appends one already-encoded entry, starting a new payload if it would not fit.
+    fn push(&mut self, entry: &[u8]) {
+        if self.buf.len() + entry.len() > MAX_RESPONSE_BYTES {
+            self.flush(false);
+        }
+        self.buf.bytes(entry);
+    }
+
+    /// Closes the block entity list and moves on to sections.
+    fn end_entities(&mut self) {
+        self.buf.i64(MIN_POSITION_LONG);
+        self.entities_open = false;
+    }
+
+    fn flush(&mut self, finished: bool) {
+        if self.entities_open {
+            self.buf.i64(MIN_POSITION_LONG);
+        }
+        self.buf.i64(MIN_POSITION_LONG);
+        self.buf.bool(finished);
+
+        let payload = core::mem::take(&mut self.buf).into_vec();
+        send(self.player, "axiom:response_chunk_data", &payload);
+
+        self.buf.i64(self.id);
+        if !self.entities_open {
+            // Block entities were already closed; the continuation says so again.
+            self.buf.i64(MIN_POSITION_LONG);
+        }
+    }
+
+    fn finish(mut self) {
+        self.flush(true);
+    }
+}
 
 /// `axiom:request_chunk_data` — the client asking for world data it cannot see
 /// itself, which is what makes copying beyond render distance work.
@@ -582,73 +643,86 @@ pub fn request_chunk_data(player: &Player, body: &[u8]) -> Result<(), String> {
     // The client waits on a response for every request, so a refusal still has to
     // be answered — just with nothing in it.
     if !has_perm(player, permissions::CHUNK_REQUEST) {
-        send_chunk_data(player, chunk_response_start(id), true);
+        ChunkResponse::new(player, id).finish();
         return Ok(());
     }
 
     let dimension = r.string().map_err(err)?.to_owned();
-    let _block_entities_in_chunks = r.bool().map_err(err)?;
+    let _entities_in_chunks = r.bool().map_err(err)?;
 
-    let block_entities = r.var_len("block entity list", MAX_COLLECTION).map_err(err)?;
-    for _ in 0..block_entities {
-        // ponytail: block entity payloads would have to be zstd-compressed with
-        // the trained dictionary, and ruzstd only decompresses. Sections still
-        // answer, so copying geometry works; chest contents beyond render
-        // distance do not. Needs a zstd encoder to finish.
-        let _pos = r.i64().map_err(err)?;
+    let requested_entities = r.var_len("block entity list", MAX_COLLECTION).map_err(err)?;
+    let mut entity_positions = Vec::with_capacity(requested_entities);
+    for _ in 0..requested_entities {
+        entity_positions.push(r.i64().map_err(err)?);
     }
 
-    let requested = r.var_len("section list", MAX_COLLECTION).map_err(err)?;
-    let mut keys = Vec::with_capacity(requested.min(MAX_SECTIONS_PER_REQUEST));
-    for i in 0..requested {
+    let requested_sections = r.var_len("section list", MAX_COLLECTION).map_err(err)?;
+    let mut section_keys = Vec::with_capacity(requested_sections.min(MAX_SECTIONS_PER_REQUEST));
+    for i in 0..requested_sections {
         let key = r.i64().map_err(err)?;
         if i < MAX_SECTIONS_PER_REQUEST {
-            keys.push(key);
+            section_keys.push(key);
         }
     }
 
     let world = player.get_world();
     if !same_dimension(&world.get_dimension(), &dimension) {
-        send_chunk_data(player, chunk_response_start(id), true);
+        ChunkResponse::new(player, id).finish();
         return Ok(());
     }
 
     let remap = client_remap(player);
     let started = std::time::Instant::now();
-    let mut response = chunk_response_start(id);
-    let mut served = 0_usize;
+    let mut response = ChunkResponse::new(player, id);
 
-    for key in keys {
+    if has_perm(player, permissions::CHUNK_REQUESTBLOCKENTITY) {
+        for packed in entity_positions {
+            let (x, y, z) = unpack_block_pos(packed);
+            if world.get_chunk(x >> 4, z >> 4).is_none() {
+                continue;
+            }
+            let Some(nbt) = world.get_block_entity_nbt(BlockPos { x, y, z }) else {
+                continue;
+            };
+            let Some(named) = nbt::to_named_root(&nbt) else {
+                continue;
+            };
+            let mut entry = Writer::new();
+            entry.i64(packed);
+            entry.var_i32(named.len() as i32);
+            entry.u8(nbt::SUPPORTED_DICTIONARY);
+            entry.byte_array(&nbt::compress_raw(&named));
+            response.push(&entry.into_vec());
+        }
+    }
+    response.end_entities();
+
+    let mut served = 0_usize;
+    for key in section_keys {
         let (section_x, section_y, section_z) = unpack_block_pos(key);
         let Some(chunk) = world.get_chunk(section_x, section_z) else {
-            // Not loaded, and a plugin cannot force a load; the client keeps what
-            // it already had for this section.
+            // Not loaded, and a plugin cannot force a load; the client keeps
+            // whatever it already had for this section.
             continue;
         };
 
-        let mut part = Writer::new();
-        part.i64(key);
+        let mut entry = Writer::new();
+        entry.i64(key);
         match read_section(&chunk, section_y, remap) {
             Some(entries) => {
-                part.bool(true);
-                if !palette::write_section_indirect(&mut part, &entries) {
+                entry.bool(true);
+                if !palette::write_section_indirect(&mut entry, &entries) {
                     continue;
                 }
             }
             None => {
-                part.bool(false);
+                entry.bool(false);
             }
         }
-
-        if response.len() + part.len() > MAX_RESPONSE_BYTES {
-            send_chunk_data(player, response, false);
-            response = chunk_response_start(id);
-        }
-        response.bytes(&part.into_vec());
+        response.push(&entry.into_vec());
         served += 1;
     }
-
-    send_chunk_data(player, response, true);
+    response.finish();
 
     // Every block read is its own host call, so this is the one place a single
     // Axiom packet can stall a tick. Surface it when it actually does.
@@ -697,18 +771,4 @@ fn read_section(chunk: &Chunk, section_y: i32, remap: Option<&'static Tables>) -
     }
     debug_assert_eq!(entries.len(), SECTION_VOLUME);
     (!all_air).then_some(entries)
-}
-
-fn chunk_response_start(id: i64) -> Writer {
-    let mut w = Writer::new();
-    w.i64(id);
-    // Block entities are not answered; an immediate terminator keeps the shape.
-    w.i64(MIN_POSITION_LONG);
-    w
-}
-
-fn send_chunk_data(player: &Player, mut response: Writer, finished: bool) {
-    response.i64(MIN_POSITION_LONG);
-    response.bool(finished);
-    send(player, "axiom:response_chunk_data", &response.into_vec());
 }
