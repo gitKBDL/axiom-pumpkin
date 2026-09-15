@@ -7,7 +7,7 @@ use pumpkin_plugin_api::{
     common::{BlockPos, GameMode},
     java_packets::{CAcknowledgeBlockChange, ClientboundPacket},
     player::Player,
-    world::{self, BlockFlags, Chunk, World},
+    world::{self, BlockFlags, Chunk, Entity, EntityType, World},
 };
 
 use crate::block_remap::{self, Tables};
@@ -824,4 +824,96 @@ fn section_for_client(
             .map(|id| client_state(remap, id).unwrap_or(0))
             .collect(),
     )
+}
+
+/// Looks up the entities a packet named by UUID, in one sweep of the world.
+///
+/// The plugin API has no lookup by UUID, so the alternative would be a full sweep
+/// per requested entity.
+fn entities_by_uuid(world: &World, wanted: &[(u64, u64)]) -> Vec<(usize, Entity)> {
+    let mut found = Vec::new();
+    for entity in world.get_entities() {
+        let id = entity.get_uuid();
+        if let Some(index) = wanted.iter().position(|&w| w == (id.high, id.low)) {
+            found.push((index, entity));
+        }
+    }
+    found
+}
+
+fn read_uuid_list(r: &mut Reader<'_>) -> Result<Vec<(u64, u64)>, String> {
+    let err = |e: crate::buf::Error| e.to_string();
+    let count = r.var_len("uuid list", MAX_COLLECTION).map_err(err)?;
+    let mut list = Vec::with_capacity(count);
+    for _ in 0..count {
+        list.push(r.uuid().map_err(err)?);
+    }
+    Ok(list)
+}
+
+/// `axiom:delete_entity`
+pub fn delete_entity(player: &Player, body: &[u8]) -> Result<(), String> {
+    let wanted = read_uuid_list(&mut Reader::new(body))?;
+    if !has_perm(player, permissions::ENTITY_DELETE) {
+        return Ok(());
+    }
+    let world = player.get_world();
+    let mut removed = 0_usize;
+    for (_, entity) in entities_by_uuid(&world, &wanted) {
+        // Removing a player, or a vehicle carrying one, is never what the tool means.
+        if entity.get_type() == EntityType::Player {
+            continue;
+        }
+        entity.remove();
+        removed += 1;
+    }
+    tracing::debug!("Removed {removed} entities for {}", player.get_name());
+    Ok(())
+}
+
+/// `axiom:request_entity_data` — the client asking for the NBT of entities it
+/// wants to edit.
+pub fn request_entity_data(player: &Player, body: &[u8]) -> Result<(), String> {
+    let mut r = Reader::new(body);
+    let id = r.i64().map_err(|e| e.to_string())?;
+
+    // As with chunk data, a refusal still has to be answered or the client waits.
+    if !has_perm(player, permissions::ENTITY_REQUESTDATA) {
+        send_entity_data(player, id, true, &[]);
+        return Ok(());
+    }
+    let wanted = read_uuid_list(&mut r)?;
+    let world = player.get_world();
+
+    let mut batch: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+    let mut batch_bytes = 0_usize;
+    for (index, entity) in entities_by_uuid(&world, &wanted) {
+        if entity.get_type() == EntityType::Player {
+            continue;
+        }
+        let nbt = entity.get_nbt();
+        if nbt.len() >= MAX_RESPONSE_BYTES {
+            // Too big to share a payload with anything else.
+            send_entity_data(player, id, false, &[(wanted[index].0, wanted[index].1, nbt)]);
+            continue;
+        }
+        if batch_bytes + nbt.len() > MAX_RESPONSE_BYTES {
+            send_entity_data(player, id, false, &batch);
+            batch.clear();
+            batch_bytes = 0;
+        }
+        batch_bytes += nbt.len();
+        batch.push((wanted[index].0, wanted[index].1, nbt));
+    }
+    send_entity_data(player, id, true, &batch);
+    Ok(())
+}
+
+fn send_entity_data(player: &Player, id: i64, finished: bool, entries: &[(u64, u64, Vec<u8>)]) {
+    let mut w = Writer::new();
+    w.i64(id).bool(finished).var_i32(entries.len() as i32);
+    for (high, low, nbt) in entries {
+        w.uuid(*high, *low).bytes(nbt);
+    }
+    send(player, "axiom:response_entity_data", &w.into_vec());
 }
