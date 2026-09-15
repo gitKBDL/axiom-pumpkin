@@ -12,6 +12,7 @@ use pumpkin_plugin_api::{
 
 use crate::block_remap::{self, Tables};
 use crate::buf::{Reader, Writer, pack_block_pos, unpack_block_pos};
+use crate::biomes;
 use crate::nbt;
 use crate::palette::{self, SECTION_VOLUME, index_of};
 use crate::permissions;
@@ -316,9 +317,7 @@ pub fn set_buffer(player: &Player, body: &[u8]) -> Result<(), String> {
 
     match r.u8().map_err(err)? {
         0 => apply_block_buffer(player, &mut r, &world_key),
-        // Biome buffers need a per-section biome write, which the plugin API does
-        // not expose yet; dropping them leaves blocks working.
-        1 => Ok(()),
+        1 => apply_biome_buffer(player, &mut r, &world_key),
         other => Err(format!("unknown buffer type: {other}")),
     }
 }
@@ -708,7 +707,7 @@ pub fn request_chunk_data(player: &Player, body: &[u8]) -> Result<(), String> {
 
         let mut entry = Writer::new();
         entry.i64(key);
-        match read_section(&chunk, section_y, remap) {
+        match section_for_client(&chunk, section_y, remap) {
             Some(entries) => {
                 entry.bool(true);
                 if !palette::write_section_indirect(&mut entry, &entries) {
@@ -741,34 +740,88 @@ pub fn request_chunk_data(player: &Player, body: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Reads one section out of a loaded chunk, in the client's registry.
+/// `axiom:set_buffer` type 1 — the biome painter.
 ///
-/// Returns `None` for an all-air section, which the response encodes as "no data"
-/// rather than 4096 copies of air.
-fn read_section(chunk: &Chunk, section_y: i32, remap: Option<&'static Tables>) -> Option<Vec<u16>> {
-    let base_y = section_y * 16;
-    let mut entries = Vec::with_capacity(SECTION_VOLUME);
-    let mut all_air = true;
+/// Biomes travel as a byte per 4x4x4 cell indexing a small per-buffer palette of
+/// registry names, grouped into 16x16x16 blocks of cells.
+fn apply_biome_buffer(player: &Player, r: &mut Reader<'_>, world_key: &str) -> Result<(), String> {
+    let err = |e: crate::buf::Error| e.to_string();
 
-    // Iterating y, then z, then x fills the vector in exactly the order
-    // `index_of` defines, so no reshuffle is needed afterwards.
-    for y in 0..16 {
-        for z in 0..16 {
-            for x in 0..16 {
-                let id = chunk.get_block_state_id(BlockPos {
-                    x: x as i32,
-                    y: base_y + y as i32,
-                    z: z as i32,
-                });
-                if id != 0 {
-                    all_air = false;
-                }
-                // An id the client has no name for is sent as air; showing the
-                // player a wrong block would be worse than showing a gap.
-                entries.push(client_state(remap, id).unwrap_or(0));
+    let palette_len = usize::from(r.u8().map_err(err)?);
+    let mut palette = Vec::with_capacity(palette_len);
+    for _ in 0..palette_len {
+        // A biome this server does not know stays `None` and its cells are skipped.
+        palette.push(biomes::from_name(r.string().map_err(err)?));
+    }
+
+    let unset = r.u8().map_err(err)?;
+    if !has_perm(player, permissions::BUILD_SECTION) {
+        return Ok(());
+    }
+    let world = player.get_world();
+    let dimension = world.get_dimension();
+    if !same_dimension(&dimension, world_key) {
+        tracing::warn!("Dropping biome buffer for {world_key}; player is in {dimension}");
+        return Ok(());
+    }
+
+    let mut painted = 0_usize;
+    loop {
+        let key = r.i64().map_err(err)?;
+        if key == MIN_POSITION_LONG {
+            break;
+        }
+        let (block_x, block_y, block_z) = unpack_block_pos(key);
+        let cells = r.take(SECTION_VOLUME).map_err(err)?;
+
+        for (index, &entry) in cells.iter().enumerate() {
+            // 0 means "never set"; the default value means "unchanged".
+            if entry == 0 || entry == unset {
+                continue;
             }
+            let Some(Some(biome)) = palette.get(usize::from(entry) - 1) else {
+                continue;
+            };
+            // Cells are laid out with x fastest, then y, then z.
+            let (x, y, z) = (index % 16, (index / 16) % 16, index / 256);
+            // Key and index are in cell units; a cell covers four blocks per axis.
+            world.set_biome(
+                BlockPos {
+                    x: (block_x * 16 + x as i32) * 4,
+                    y: (block_y * 16 + y as i32) * 4,
+                    z: (block_z * 16 + z as i32) * 4,
+                },
+                *biome,
+            );
+            painted += 1;
         }
     }
-    debug_assert_eq!(entries.len(), SECTION_VOLUME);
-    (!all_air).then_some(entries)
+    tracing::debug!("Painted {painted} biome cells for {}", player.get_name());
+    Ok(())
+}
+
+/// Reads one section out of a loaded chunk and re-expresses it in the client's
+/// registry.
+///
+/// Returns `None` for a section that is outside the world or entirely air; the
+/// response encodes that as "no data" rather than 4096 copies of air.
+fn section_for_client(
+    chunk: &Chunk,
+    section_y: i32,
+    remap: Option<&'static Tables>,
+) -> Option<Vec<u16>> {
+    // One host call for the whole section. Reading it block by block was 4096
+    // calls and made a copy of any size stall the tick.
+    let states = chunk.read_section(section_y)?;
+    if states.len() != SECTION_VOLUME || states.iter().all(|&id| id == 0) {
+        return None;
+    }
+    Some(
+        states
+            .into_iter()
+            // An id the client has no name for is sent as air; showing the player
+            // a wrong block would be worse than showing a gap.
+            .map(|id| client_state(remap, id).unwrap_or(0))
+            .collect(),
+    )
 }

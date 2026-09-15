@@ -5,6 +5,7 @@
 //! random token to every player allowed to use Axiom, and the client echoes the
 //! token back along with its API version. A matching echo enables the client.
 
+mod biomes;
 mod block_remap;
 mod buf;
 mod handlers;
