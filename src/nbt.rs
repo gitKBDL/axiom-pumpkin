@@ -6,6 +6,9 @@
 //! knob — a blob compressed with it cannot be read without it — so it is embedded
 //! here verbatim from the upstream plugin's resources.
 
+// The tag scanner is groundwork for the entity packets and has no caller yet.
+#![allow(dead_code)]
+
 use std::sync::{Mutex, OnceLock};
 
 use ruzstd::FrameDecoder;
