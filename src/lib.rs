@@ -45,6 +45,7 @@ pub const SUPPORTED_PACKETS: &[&str] = &["axiom:tunnel", "axiom:hello", "axiom:s
     "axiom:teleport",
     "axiom:set_world_time",
     "axiom:set_no_physical_trigger",
+    "axiom:request_chunk_data",
 ];
 
 static PLAYERS: Mutex<Option<HashMap<PlayerKey, PlayerState>>> = Mutex::new(None);

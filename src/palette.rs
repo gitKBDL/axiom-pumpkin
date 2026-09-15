@@ -103,18 +103,48 @@ fn read_id(r: &mut Reader<'_>) -> Result<u16> {
     })
 }
 
-/// Writes a section back out in the same format, always using the direct palette.
-/// Used to answer chunk-data requests and to exercise [`read_section`] in tests.
-pub fn write_section(w: &mut Writer, entries: &[u16], direct_bits: u8) {
+/// Largest palette an indirect section can carry, at 8 bits per entry.
+const MAX_INDIRECT_PALETTE: usize = 1 << 8;
+
+/// Writes a section using an indirect palette.
+///
+/// Indirect is deliberate: for widths of 4..=8 the reader honours the width we
+/// declare, whereas a direct section is decoded at whatever width the reader's own
+/// registry implies — which we would have to guess for an older client. Returns
+/// `false` if the section holds more distinct states than a palette can address,
+/// which a 16³ section realistically never does.
+pub fn write_section_indirect(w: &mut Writer, entries: &[u16]) -> bool {
     debug_assert_eq!(entries.len(), SECTION_VOLUME);
-    let bits = direct_bits.clamp(9, MAX_BITS);
+
+    let mut palette: Vec<u16> = Vec::new();
+    let mut indices = Vec::with_capacity(SECTION_VOLUME);
+    for &entry in entries {
+        let index = match palette.iter().position(|&seen| seen == entry) {
+            Some(index) => index,
+            None => {
+                if palette.len() == MAX_INDIRECT_PALETTE {
+                    return false;
+                }
+                palette.push(entry);
+                palette.len() - 1
+            }
+        };
+        indices.push(index as u64);
+    }
+
+    let bits = encompassing_bits(palette.len()).max(MIN_INDIRECT_BITS);
     let per_word = 64 / bits as usize;
 
     w.u8(bits);
+    w.var_i32(palette.len() as i32);
+    for entry in &palette {
+        w.var_i32(i32::from(*entry));
+    }
+
     let mut word = 0_u64;
     let mut in_word = 0;
-    for (i, &entry) in entries.iter().enumerate() {
-        word |= u64::from(entry) << (in_word * bits as usize);
+    for (i, &index) in indices.iter().enumerate() {
+        word |= index << (in_word * bits as usize);
         in_word += 1;
         if in_word == per_word || i == SECTION_VOLUME - 1 {
             w.i64(word as i64);
@@ -122,6 +152,13 @@ pub fn write_section(w: &mut Writer, entries: &[u16], direct_bits: u8) {
             in_word = 0;
         }
     }
+    true
+}
+
+/// Bits needed to address `len` palette entries.
+fn encompassing_bits(len: usize) -> u8 {
+    let len = len.max(2) as u32;
+    (u32::BITS - (len - 1).leading_zeros()) as u8
 }
 
 #[cfg(test)]
@@ -133,16 +170,29 @@ mod tests {
 
     fn roundtrip(entries: &[u16]) {
         let mut w = Writer::new();
-        write_section(&mut w, entries, DIRECT_BITS);
+        assert!(write_section_indirect(&mut w, entries), "palette should fit");
         let bytes = w.into_vec();
         let decoded = read_section(&mut Reader::new(&bytes), DIRECT_BITS).expect("decodes");
         assert_eq!(decoded, entries);
     }
 
     #[test]
-    fn direct_palette_roundtrips() {
-        let entries: Vec<u16> = (0..SECTION_VOLUME).map(|i| (i % 30_000) as u16).collect();
+    fn indirect_palette_roundtrips() {
+        // 200 distinct states, so the palette needs the full 8 bits.
+        let entries: Vec<u16> = (0..SECTION_VOLUME).map(|i| (i % 200 + 15_000) as u16).collect();
         roundtrip(&entries);
+    }
+
+    #[test]
+    fn a_uniform_section_roundtrips() {
+        roundtrip(&vec![1_u16; SECTION_VOLUME]);
+    }
+
+    #[test]
+    fn a_section_too_varied_for_a_palette_is_refused() {
+        let entries: Vec<u16> = (0..SECTION_VOLUME).map(|i| (i % 1000) as u16).collect();
+        let mut w = Writer::new();
+        assert!(!write_section_indirect(&mut w, &entries));
     }
 
     #[test]

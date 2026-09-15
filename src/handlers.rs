@@ -7,15 +7,16 @@ use pumpkin_plugin_api::{
     common::{BlockPos, GameMode},
     java_packets::{CAcknowledgeBlockChange, ClientboundPacket},
     player::Player,
-    world::{self, BlockFlags, World},
+    world::{self, BlockFlags, Chunk, World},
 };
 
-use crate::block_remap::{self, Run};
-use crate::buf::{Reader, pack_block_pos, unpack_block_pos};
+use crate::block_remap::{self, Tables};
+use crate::buf::{Reader, Writer, pack_block_pos, unpack_block_pos};
 use crate::nbt;
 use crate::palette::{self, SECTION_VOLUME, index_of};
 use crate::permissions;
 use crate::proto::{consume_dispatch_sends, has_perm};
+use crate::send;
 
 /// Upstream's default `packetCollectionReadLimit`, which bounds how many entries a
 /// single packet may declare before we start allocating for them.
@@ -116,10 +117,10 @@ fn void_air() -> u16 {
 /// the chunk data it sends, but plugin messages pass through untouched — so an
 /// older client's Axiom packets arrive in *its* registry, where the same number
 /// means a different block. Upstream leans on ViaVersion for exactly this.
-fn client_remap(player: &Player) -> Option<&'static [Run]> {
+fn client_remap(player: &Player) -> Option<&'static Tables> {
     player
         .as_java()
-        .and_then(|java| block_remap::table_for(java.get_version()))
+        .and_then(|java| block_remap::tables_for(java.get_version()))
 }
 
 /// Human-readable note about whether this client's block ids need translating.
@@ -128,7 +129,7 @@ pub fn describe_client_registry(player: &Player) -> String {
         return "not a Java client".to_owned();
     };
     let version = java.get_version();
-    if block_remap::table_for(version).is_some() {
+    if block_remap::tables_for(version).is_some() {
         format!("client {version:?}, translating block ids to the server registry")
     } else {
         format!("client {version:?}, same block registry as the server")
@@ -140,12 +141,20 @@ pub fn describe_client_registry(player: &Player) -> String {
 /// `None` means the id has no equivalent here; callers treat that as "leave this
 /// block alone", which is the only safe reading — guessing a replacement would
 /// silently rewrite the player's build.
-fn server_state(remap: Option<&'static [Run]>, client_id: u16) -> Option<u16> {
+fn server_state(remap: Option<&'static Tables>, client_id: u16) -> Option<u16> {
     let id = match remap {
-        Some(table) => block_remap::to_server(table, client_id)?,
+        Some(tables) => block_remap::to_server(tables.to_server, client_id)?,
         None => client_id,
     };
     (u32::from(id) < state_count()).then_some(id)
+}
+
+/// The reverse: one of our ids expressed in the client's registry.
+fn client_state(remap: Option<&'static Tables>, server_id: u16) -> Option<u16> {
+    match remap {
+        Some(tables) => block_remap::to_client(tables.to_client, server_id),
+        None => Some(server_id),
+    }
 }
 
 /// Flags matching Axiom's two placement modes.
@@ -251,7 +260,7 @@ fn describe(id: u16) -> String {
     )
 }
 
-fn diagnose_first_section(remap: Option<&'static [Run]>, declared_bits: u8, entries: &[u16]) {
+fn diagnose_first_section(remap: Option<&'static Tables>, declared_bits: u8, entries: &[u16]) {
     if DIAGNOSED.swap(1, Ordering::Relaxed) != 0 {
         return;
     }
@@ -434,7 +443,7 @@ fn apply_block_buffer<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_remap::{table_for, to_server};
+    use crate::block_remap::{tables_for, to_client, to_server};
     use pumpkin_plugin_api::player::JavaMinecraftVersion;
 
     /// Regression: a 1.21.9 client calls `void_air` 15090 while the 26.2 server
@@ -442,16 +451,19 @@ mod tests {
     /// to leave untouched get overwritten.
     #[test]
     fn older_client_ids_translate_to_the_server_registry() {
-        let table = table_for(JavaMinecraftVersion::V1219).expect("1.21.9 needs translation");
-        assert_eq!(to_server(table, 15090), Some(15292), "void_air");
-        assert_eq!(to_server(table, 1), Some(1), "stone is unchanged");
-        assert_eq!(to_server(table, 0), Some(0), "air is unchanged");
+        let tables = tables_for(JavaMinecraftVersion::V1219).expect("1.21.9 needs translation");
+        assert_eq!(to_server(tables.to_server, 15090), Some(15292), "void_air");
+        assert_eq!(to_server(tables.to_server, 1), Some(1), "stone is unchanged");
+        assert_eq!(to_server(tables.to_server, 0), Some(0), "air is unchanged");
+        // And back again, for ids we send to the client.
+        assert_eq!(to_client(tables.to_client, 15292), Some(15090), "void_air");
+        assert_eq!(to_client(tables.to_client, 1), Some(1), "stone is unchanged");
     }
 
     /// A client on the server's own version must not be translated at all.
     #[test]
     fn current_version_needs_no_translation() {
-        assert!(table_for(JavaMinecraftVersion::V262).is_none());
+        assert!(tables_for(JavaMinecraftVersion::V262).is_none());
     }
 }
 
@@ -547,4 +559,156 @@ pub fn set_no_physical_trigger(player: &Player, body: &[u8]) -> Result<(), Strin
         crate::proto::set_no_physical_trigger(player, enabled);
     }
     Ok(())
+}
+
+/// One clientbound payload may carry a mebibyte; upstream leaves the same leeway.
+const MAX_RESPONSE_BYTES: usize = (1 << 20) - 64;
+
+/// Sections served per request. Every block crosses the WASM boundary on its own
+/// host call, so an unbounded request would stall the server tick; a partial
+/// answer is legitimate — upstream also drops sections it cannot reach.
+const MAX_SECTIONS_PER_REQUEST: usize = 128;
+
+/// Above this, answering a chunk request cost more than a server tick.
+const SLOW_REQUEST: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// `axiom:request_chunk_data` — the client asking for world data it cannot see
+/// itself, which is what makes copying beyond render distance work.
+pub fn request_chunk_data(player: &Player, body: &[u8]) -> Result<(), String> {
+    let mut r = Reader::new(body);
+    let err = |e: crate::buf::Error| e.to_string();
+    let id = r.i64().map_err(err)?;
+
+    // The client waits on a response for every request, so a refusal still has to
+    // be answered — just with nothing in it.
+    if !has_perm(player, permissions::CHUNK_REQUEST) {
+        send_chunk_data(player, chunk_response_start(id), true);
+        return Ok(());
+    }
+
+    let dimension = r.string().map_err(err)?.to_owned();
+    let _block_entities_in_chunks = r.bool().map_err(err)?;
+
+    let block_entities = r.var_len("block entity list", MAX_COLLECTION).map_err(err)?;
+    for _ in 0..block_entities {
+        // ponytail: block entity payloads would have to be zstd-compressed with
+        // the trained dictionary, and ruzstd only decompresses. Sections still
+        // answer, so copying geometry works; chest contents beyond render
+        // distance do not. Needs a zstd encoder to finish.
+        let _pos = r.i64().map_err(err)?;
+    }
+
+    let requested = r.var_len("section list", MAX_COLLECTION).map_err(err)?;
+    let mut keys = Vec::with_capacity(requested.min(MAX_SECTIONS_PER_REQUEST));
+    for i in 0..requested {
+        let key = r.i64().map_err(err)?;
+        if i < MAX_SECTIONS_PER_REQUEST {
+            keys.push(key);
+        }
+    }
+
+    let world = player.get_world();
+    if !same_dimension(&world.get_dimension(), &dimension) {
+        send_chunk_data(player, chunk_response_start(id), true);
+        return Ok(());
+    }
+
+    let remap = client_remap(player);
+    let started = std::time::Instant::now();
+    let mut response = chunk_response_start(id);
+    let mut served = 0_usize;
+
+    for key in keys {
+        let (section_x, section_y, section_z) = unpack_block_pos(key);
+        let Some(chunk) = world.get_chunk(section_x, section_z) else {
+            // Not loaded, and a plugin cannot force a load; the client keeps what
+            // it already had for this section.
+            continue;
+        };
+
+        let mut part = Writer::new();
+        part.i64(key);
+        match read_section(&chunk, section_y, remap) {
+            Some(entries) => {
+                part.bool(true);
+                if !palette::write_section_indirect(&mut part, &entries) {
+                    continue;
+                }
+            }
+            None => {
+                part.bool(false);
+            }
+        }
+
+        if response.len() + part.len() > MAX_RESPONSE_BYTES {
+            send_chunk_data(player, response, false);
+            response = chunk_response_start(id);
+        }
+        response.bytes(&part.into_vec());
+        served += 1;
+    }
+
+    send_chunk_data(player, response, true);
+
+    // Every block read is its own host call, so this is the one place a single
+    // Axiom packet can stall a tick. Surface it when it actually does.
+    let elapsed = started.elapsed();
+    if elapsed > SLOW_REQUEST {
+        tracing::info!(
+            "Served {served} chunk sections to {} in {elapsed:?}",
+            player.get_name()
+        );
+    } else {
+        tracing::debug!(
+            "Served {served} chunk sections to {} in {elapsed:?}",
+            player.get_name()
+        );
+    }
+    Ok(())
+}
+
+/// Reads one section out of a loaded chunk, in the client's registry.
+///
+/// Returns `None` for an all-air section, which the response encodes as "no data"
+/// rather than 4096 copies of air.
+fn read_section(chunk: &Chunk, section_y: i32, remap: Option<&'static Tables>) -> Option<Vec<u16>> {
+    let base_y = section_y * 16;
+    let mut entries = Vec::with_capacity(SECTION_VOLUME);
+    let mut all_air = true;
+
+    // Iterating y, then z, then x fills the vector in exactly the order
+    // `index_of` defines, so no reshuffle is needed afterwards.
+    for y in 0..16 {
+        for z in 0..16 {
+            for x in 0..16 {
+                let id = chunk.get_block_state_id(BlockPos {
+                    x: x as i32,
+                    y: base_y + y as i32,
+                    z: z as i32,
+                });
+                if id != 0 {
+                    all_air = false;
+                }
+                // An id the client has no name for is sent as air; showing the
+                // player a wrong block would be worse than showing a gap.
+                entries.push(client_state(remap, id).unwrap_or(0));
+            }
+        }
+    }
+    debug_assert_eq!(entries.len(), SECTION_VOLUME);
+    (!all_air).then_some(entries)
+}
+
+fn chunk_response_start(id: i64) -> Writer {
+    let mut w = Writer::new();
+    w.i64(id);
+    // Block entities are not answered; an immediate terminator keeps the shape.
+    w.i64(MIN_POSITION_LONG);
+    w
+}
+
+fn send_chunk_data(player: &Player, mut response: Writer, finished: bool) {
+    response.i64(MIN_POSITION_LONG);
+    response.bool(finished);
+    send(player, "axiom:response_chunk_data", &response.into_vec());
 }
