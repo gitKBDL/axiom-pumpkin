@@ -299,6 +299,13 @@ fn dispatch(server: &Server, player: &Player, id: &str, body: &[u8]) {
         "axiom:request_entity_data" => crate::handlers::request_entity_data(player, body),
         "axiom:manipulate_entity" => crate::handlers::manipulate_entity(player, body),
         "axiom:tick_blocks" => crate::handlers::tick_blocks(player, body),
+        "axiom:annotation_update" if crate::annotations::ENABLED => {
+            if has_perm(player, permissions::ANNOTATION_CREATE) {
+                crate::annotations::handle(server, player, body)
+            } else {
+                Ok(())
+            }
+        }
         // Unknown ids arrive whenever the client runs ahead of what this port
         // implements. Upstream kicks; ignoring is friendlier and equally safe,
         // because nothing was applied.
@@ -384,6 +391,10 @@ fn activate(player: &Player) {
         state.restrictions = None;
         state.tunnel.reset();
     });
+
+    if crate::annotations::ENABLED {
+        crate::annotations::send_all(player);
+    }
 
     // The client expects its restrictions immediately after being enabled.
     with_players(|states| {

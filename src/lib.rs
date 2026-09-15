@@ -5,6 +5,7 @@
 //! random token to every player allowed to use Axiom, and the client echoes the
 //! token back along with its API version. A matching echo enables the client.
 
+mod annotations;
 mod biomes;
 mod block_remap;
 mod buf;
@@ -51,6 +52,7 @@ pub const SUPPORTED_PACKETS: &[&str] = &["axiom:tunnel", "axiom:hello", "axiom:s
     "axiom:request_entity_data",
     "axiom:manipulate_entity",
     "axiom:tick_blocks",
+    "axiom:annotation_update",
 ];
 
 static PLAYERS: Mutex<Option<HashMap<PlayerKey, PlayerState>>> = Mutex::new(None);
