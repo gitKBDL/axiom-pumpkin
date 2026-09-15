@@ -36,6 +36,8 @@ pub struct PlayerState {
     /// Remaining block-buffer budget, in twentieths of a section, as upstream
     /// tracks it. `None` until the first top-up is sent.
     pub dispatch_sends_20: Option<i32>,
+    /// Whether the player asked not to trigger pressure plates and the like.
+    pub no_physical_trigger: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -242,6 +244,11 @@ fn new_handshake_token() -> i64 {
     }
 }
 
+pub fn set_no_physical_trigger(player: &Player, enabled: bool) {
+    let key = key_of(&player.get_id());
+    with_players(|states| states.entry(key).or_default().no_physical_trigger = enabled);
+}
+
 fn is_active(player: &Player) -> bool {
     let key = key_of(&player.get_id());
     with_players(|states| states.get(&key).is_some_and(|s| s.active))
@@ -254,7 +261,7 @@ pub fn send_goodbye(player: &Player, reason: &str) {
 }
 
 /// Routes one inbound `axiom:*` plugin message.
-pub fn on_payload(player: &Player, channel: &str, data: &[u8]) {
+pub fn on_payload(server: &Server, player: &Player, channel: &str, data: &[u8]) {
     if channel == "axiom:tunnel" {
         let key = key_of(&player.get_id());
         let packet = with_players(|states| {
@@ -265,16 +272,16 @@ pub fn on_payload(player: &Player, channel: &str, data: &[u8]) {
             state.tunnel.push(data)
         });
         match packet {
-            Ok(Some(packet)) => dispatch(player, &packet.id, &packet.body),
+            Ok(Some(packet)) => dispatch(server, player, &packet.id, &packet.body),
             Ok(None) => {}
             Err(e) => kick(player, &format!("Axiom: {e}")),
         }
         return;
     }
-    dispatch(player, channel, data);
+    dispatch(server, player, channel, data);
 }
 
-fn dispatch(player: &Player, id: &str, body: &[u8]) {
+fn dispatch(server: &Server, player: &Player, id: &str, body: &[u8]) {
     if id != "axiom:hello" && !is_active(player) {
         return;
     }
@@ -282,6 +289,11 @@ fn dispatch(player: &Player, id: &str, body: &[u8]) {
         "axiom:hello" => handle_hello(player, body),
         "axiom:set_block" => crate::handlers::set_block(player, body),
         "axiom:set_buffer" => crate::handlers::set_buffer(player, body),
+        "axiom:set_gamemode" => crate::handlers::set_gamemode(player, body),
+        "axiom:set_fly_speed" => crate::handlers::set_fly_speed(player, body),
+        "axiom:teleport" => crate::handlers::teleport(server, player, body),
+        "axiom:set_world_time" => crate::handlers::set_world_time(player, body),
+        "axiom:set_no_physical_trigger" => crate::handlers::set_no_physical_trigger(player, body),
         // Unknown ids arrive whenever the client runs ahead of what this port
         // implements. Upstream kicks; ignoring is friendlier and equally safe,
         // because nothing was applied.

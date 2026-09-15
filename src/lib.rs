@@ -38,7 +38,14 @@ pub const API_VERSION: i32 = 10;
 /// Serverbound packets this port understands. Sent verbatim in `axiom:enable`; the
 /// client disables any feature whose packet is missing from the list, so a name is
 /// added here only once its handler exists.
-pub const SUPPORTED_PACKETS: &[&str] = &["axiom:tunnel", "axiom:hello", "axiom:set_block", "axiom:set_buffer"];
+pub const SUPPORTED_PACKETS: &[&str] = &["axiom:tunnel", "axiom:hello", "axiom:set_block",
+    "axiom:set_buffer",
+    "axiom:set_gamemode",
+    "axiom:set_fly_speed",
+    "axiom:teleport",
+    "axiom:set_world_time",
+    "axiom:set_no_physical_trigger",
+];
 
 static PLAYERS: Mutex<Option<HashMap<PlayerKey, PlayerState>>> = Mutex::new(None);
 
@@ -133,11 +140,11 @@ struct PayloadHandler;
 impl EventHandler<PlayerCustomPayloadEvent> for PayloadHandler {
     fn handle(
         &self,
-        _server: Server,
+        server: Server,
         event: PlayerCustomPayloadEventData,
     ) -> PlayerCustomPayloadEventData {
         if event.channel.starts_with("axiom:") {
-            proto::on_payload(&event.player, &event.channel, &event.data);
+            proto::on_payload(&server, &event.player, &event.channel, &event.data);
         }
         event
     }

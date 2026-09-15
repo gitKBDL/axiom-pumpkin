@@ -3,7 +3,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use pumpkin_plugin_api::{
-    common::BlockPos,
+    GameRule, GameRuleValue, Server,
+    common::{BlockPos, GameMode},
     java_packets::{CAcknowledgeBlockChange, ClientboundPacket},
     player::Player,
     world::{self, BlockFlags, World},
@@ -452,4 +453,98 @@ mod tests {
     fn current_version_needs_no_translation() {
         assert!(table_for(JavaMinecraftVersion::V262).is_none());
     }
+}
+
+/// `axiom:set_gamemode`
+pub fn set_gamemode(player: &Player, body: &[u8]) -> Result<(), String> {
+    let mode = Reader::new(body).u8().map_err(|e| e.to_string())?;
+    let (mode, permission) = match mode {
+        0 => (GameMode::Survival, permissions::PLAYER_GAMEMODE_SURVIVAL),
+        1 => (GameMode::Creative, permissions::PLAYER_GAMEMODE_CREATIVE),
+        2 => (GameMode::Adventure, permissions::PLAYER_GAMEMODE_ADVENTURE),
+        3 => (GameMode::Spectator, permissions::PLAYER_GAMEMODE_SPECTATOR),
+        other => return Err(format!("unknown game mode: {other}")),
+    };
+    if has_perm(player, permission) {
+        player.set_gamemode(mode);
+    }
+    Ok(())
+}
+
+/// `axiom:set_fly_speed`
+pub fn set_fly_speed(player: &Player, body: &[u8]) -> Result<(), String> {
+    let speed = Reader::new(body).f32().map_err(|e| e.to_string())?;
+    if !has_perm(player, permissions::PLAYER_SPEED) {
+        return Ok(());
+    }
+    let mut abilities = player.get_abilities();
+    abilities.fly_speed = speed.clamp(-1.0, 1.0);
+    player.set_abilities(abilities);
+    Ok(())
+}
+
+/// `axiom:teleport`
+pub fn teleport(server: &Server, player: &Player, body: &[u8]) -> Result<(), String> {
+    let mut r = Reader::new(body);
+    let err = |e: crate::buf::Error| e.to_string();
+
+    let dimension = r.string().map_err(err)?.to_owned();
+    let x = r.f64().map_err(err)?;
+    let y = r.f64().map_err(err)?;
+    let z = r.f64().map_err(err)?;
+    let yaw = r.f32().map_err(err)?;
+    let pitch = r.f32().map_err(err)?;
+
+    if !has_perm(player, permissions::PLAYER_TELEPORT) {
+        return Ok(());
+    }
+    let Some(target) = server
+        .get_all_worlds()
+        .into_iter()
+        .find(|world| same_dimension(&world.get_dimension(), &dimension))
+    else {
+        return Ok(());
+    };
+    player.teleport((x, y, z), Some(yaw), Some(pitch), target);
+    Ok(())
+}
+
+/// `axiom:set_world_time`
+pub fn set_world_time(player: &Player, body: &[u8]) -> Result<(), String> {
+    let mut r = Reader::new(body);
+    let err = |e: crate::buf::Error| e.to_string();
+
+    let dimension = r.string().map_err(err)?.to_owned();
+    // Both fields are optional; the client sends whichever the user changed.
+    let time = r.bool().map_err(err)?.then(|| r.i32()).transpose().map_err(err)?;
+    let freeze = r.bool().map_err(err)?.then(|| r.bool()).transpose().map_err(err)?;
+
+    if !has_perm(player, permissions::WORLD_TIME) || (time.is_none() && freeze.is_none()) {
+        return Ok(());
+    }
+    let world = player.get_world();
+    if !same_dimension(&world.get_dimension(), &dimension) {
+        return Ok(());
+    }
+    if let Some(time) = time {
+        world.set_time_of_day(u64::from(time.unsigned_abs()));
+    }
+    if let Some(freeze) = freeze {
+        world.set_game_rule(GameRule::AdvanceTime, GameRuleValue::Bool(!freeze));
+    }
+    Ok(())
+}
+
+/// `axiom:set_no_physical_trigger`
+///
+/// ponytail: the flag is tracked but not enforced — Pumpkin's `interact-action`
+/// has no physical variant and its generic game event carries no entity, so
+/// there is nothing to cancel from a plugin. Enforcing it needs a server-side
+/// hook; until then a player with this on still trips pressure plates.
+pub fn set_no_physical_trigger(player: &Player, body: &[u8]) -> Result<(), String> {
+    let enabled = Reader::new(body).bool().map_err(|e| e.to_string())?;
+    if has_perm(player, permissions::PLAYER_SETNOPHYSICALTRIGGER) {
+        crate::proto::set_no_physical_trigger(player, enabled);
+    }
+    Ok(())
 }
