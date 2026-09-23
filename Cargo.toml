@@ -3,7 +3,8 @@ name = "axiom-pumpkin"
 version = "0.1.0"
 edition = "2024"
 description = "Serverside component for Axiom on PumpkinMC"
-license = "GPL-3.0"
+license = "MIT"
+repository = "https://github.com/gitKBDL/axiom-pumpkin"
 
 # Standalone: do not get adopted into a parent workspace.
 [workspace]
@@ -12,7 +13,9 @@ license = "GPL-3.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-pumpkin-plugin-api = { path = "../pumpkin-src/crates/pumpkin-plugin-api" }
+# The plugin API additions this needs live on the axiom branch of this fork
+# until they are merged upstream. The tag is the server release to pair with.
+pumpkin-plugin-api = { git = "https://github.com/gitKBDL/Pumpkin-Core", tag = "axiom-v0.1.0" }
 # Pure-Rust zstd decoder. The C `zstd` crate would need a wasi-sdk C toolchain;
 # we only ever decompress inbound frames, and reply uncompressed.
 ruzstd = "0.7"

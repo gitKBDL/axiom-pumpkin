@@ -1,82 +1,43 @@
-# Axiom for PumpkinMC
+# Axiom Pumpkin Plugin
 
-Serverside component for [Axiom](https://modrinth.com/mod/axiom), ported from
-[AxiomPaperPlugin](https://github.com/Moulberry/AxiomPaperPlugin) to
-[PumpkinMC](https://github.com/Pumpkin-MC/Pumpkin).
+Serverside component for [Axiom](https://modrinth.com/mod/axiom) on [Pumpkin](https://github.com/Pumpkin-MC/Pumpkin), ported from the [Axiom Paper Plugin](https://github.com/Moulberry/AxiomPaperPlugin).
 
-Builds to a WebAssembly component. Drop `axiom.wasm` into the server's
-`plugins/` directory.
+## Download
 
-## Requires a patched server
+1. **The plugin:** `axiom.wasm` from the [latest release](https://github.com/gitKBDL/axiom-pumpkin/releases/latest). Put it in the server's `plugins/` folder.
+2. **The server:** the plugin needs a few plugin API additions that upstream Pumpkin does not have yet. Until it does, run the [Pumpkin for Axiom](https://github.com/gitKBDL/Pumpkin-Core/releases) build for your platform, made from the [`axiom` branch](https://github.com/gitKBDL/Pumpkin-Core/tree/axiom) of our fork. On a stock Pumpkin server the plugin will not load.
 
-This needs plugin API additions that are not in upstream Pumpkin yet, on the
-`axiom-plugin-api` branch of [gitKBDL/Pumpkin-Core](https://github.com/gitKBDL/Pumpkin-Core):
+Players need Minecraft 26.3 with Axiom 6.1 or newer.
 
-- `chunk.read-section` — a whole section in one call. Reading one block at a
-  time costs a host call per block, which dominates any bulk operation.
-- `world.set-biome` — biomes could only be set through the world generator's
-  chunk buffer, so a plugin had no way to change one at runtime.
-- `entity.get-nbt` / `entity.set-nbt` / `world.spawn-entity-from-nbt` — Axiom's
-  entity tools are almost entirely about entity NBT.
+## FAQ
 
-The plugin will not load on a stock Pumpkin binary.
+**Axiom works in singleplayer but not when I connect to a Pumpkin server running this plugin. What gives?**
+
+First, the player must be an op on the server. If the player does not have op permissions, run `/op <playername>`. This player must then disconnect from the server and reconnect.
+
+If you're using an alternative solution for permission management, you must give players the `axiom.default` permission.
+
+**It says Axiom does not support my Minecraft version.**
+
+Pumpkin itself only accepts clients on its own version, 26.3. Older clients can join through [pumpkin-java-multiversion](https://github.com/Pumpkin-MC/pumpkin-java-multiversion), and the plugin translates their block ids, but that plugin cannot yet get them past the configuration phase. Use Minecraft 26.3 for now.
+
+**What works?**
+
+Everything the Paper plugin turns on by default: building (placing, brushes, shapes, pasting, beyond render distance too), block entity data, biome painting, copying, the entity tools, block ticking, shared annotations, and the player and world controls (game mode, fly speed, teleport, time).
+
+Not yet: blueprints, world properties, markers and the custom blocks API, and annotations do not survive a restart. WorldGuard, PlotSquared, CoreProtect and LuckPerms have no Pumpkin counterpart, so there is no integration with them.
 
 ## Building
 
 ```sh
 rustup target add wasm32-wasip2
 cargo build --target wasm32-wasip2 --release
-cp target/wasm32-wasip2/release/axiom_pumpkin.wasm /path/to/server/plugins/axiom.wasm
 ```
 
-## Generated sources
+The plugin is `target/wasm32-wasip2/release/axiom_pumpkin.wasm`; rename it to `axiom.wasm` if you like.
 
-Three modules are generated and must not be edited by hand:
+Three modules are generated and must not be edited by hand: `src/permissions.rs` from the Paper plugin's permission enum, `src/biomes.rs` from Pumpkin's biome list, and `src/block_remap.rs` with `assets/remap/` from pumpkin-java-multiversion's block remap tables. The scripts that regenerate them are in `tools/`.
 
-- `src/permissions.rs` — Axiom's permission nodes, from the upstream Java enum.
-  `tools/gen_permissions.py ../axiom-java-reference > src/permissions.rs`
-- `src/block_remap.rs` and `assets/remap/` — block state id translation for
-  clients older than the server, from pumpkin-java-multiversion's remap tables.
-  `tools/gen_block_remap.py ../pumpkin-java-multiversion > src/block_remap.rs`
-- `src/biomes.rs` — biome lookup by registry name.
-  `tools/gen_biomes.py ../pumpkin-src > src/biomes.rs`
+## License
 
-## Client versions
-
-Pumpkin itself accepts only clients on its own version, 26.3. Older ones get in
-through [pumpkin-java-multiversion](https://github.com/Pumpkin-MC/pumpkin-java-multiversion),
-which remaps block state ids in the chunk data it relays but passes plugin
-messages through untouched — so an older client's Axiom packets arrive in *its*
-registry, where the same number means a different block. Ids are translated in
-both directions here, which is the job upstream delegates to ViaVersion.
-
-A client on a version with no translation table is refused rather than let
-loose on the world with ids that mean something else.
-
-## Status
-
-Working: the handshake and permission model, the `axiom:tunnel` transport,
-individual block placement, section buffers (brushes, shapes, paste), block
-entity NBT, biome painting, chunk data requests, entity spawn / delete /
-manipulate / data requests, block ticking, shared annotations, and the player
-and world controls (game mode, fly speed, teleport, time).
-
-Entity NBT from the client is filtered through the same allow-list upstream
-uses, so the entity tools cannot hand out items, health or anything else a
-saved entity carries.
-
-Not implemented:
-
-- **Blueprints and world properties.** Both are off by default upstream;
-  world properties and the custom block and display APIs exist for other
-  plugins to build on, and there are none here yet.
-- **Markers.** Niche, and off by default upstream.
-- **`set_no_physical_trigger`.** The flag is tracked but cannot be enforced:
-  Pumpkin's `interact-action` has no physical variant and its generic game
-  event carries no entity, so there is nothing for a plugin to cancel.
-- **Annotation persistence.** Annotations are kept in memory and lost on
-  restart; upstream stores them in the world's persistent data.
-
-Integrations with no Pumpkin equivalent are out of scope: WorldGuard,
-PlotSquared, CoreProtect and LuckPerms. Blueprints from older Minecraft
-versions would need DataFixerUpper, which has no Rust equivalent.
+MIT, like the Axiom Paper Plugin this is ported from.
