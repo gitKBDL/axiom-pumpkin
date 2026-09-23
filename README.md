@@ -5,7 +5,7 @@ Serverside component for [Axiom](https://modrinth.com/mod/axiom) on [Pumpkin](ht
 ## Download
 
 1. **The plugin:** `axiom.wasm` from the [latest release](https://github.com/gitKBDL/axiom-pumpkin/releases/latest). Put it in the server's `plugins/` folder.
-2. **The server:** the plugin needs a few plugin API additions that upstream Pumpkin does not have yet. Until it does, run the [Pumpkin for Axiom](https://github.com/gitKBDL/Pumpkin-Core/releases) build for your platform, made from the [`axiom` branch](https://github.com/gitKBDL/Pumpkin-Core/tree/axiom) of our fork. On a stock Pumpkin server the plugin will not load.
+2. **The server:** the plugin needs a few plugin API additions that upstream Pumpkin does not have yet ([#3719](https://github.com/Pumpkin-MC/Pumpkin/pull/3719), [#3720](https://github.com/Pumpkin-MC/Pumpkin/pull/3720), [#3721](https://github.com/Pumpkin-MC/Pumpkin/pull/3721)). Until it does, run the [Pumpkin for Axiom](https://github.com/gitKBDL/Pumpkin-Core/releases) build for your platform, made from the [`axiom` branch](https://github.com/gitKBDL/Pumpkin-Core/tree/axiom) of our fork. On a stock Pumpkin server the plugin will not load.
 
 Players need Minecraft 26.3 with Axiom 6.1 or newer. Older versions have to wait for Pumpkin, see the FAQ.
 
