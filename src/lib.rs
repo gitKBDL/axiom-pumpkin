@@ -26,7 +26,7 @@ use pumpkin_plugin_api::{
     Context, Plugin, PluginMetadata, Result, Server,
     events::{EventHandler, EventPriority, PlayerCustomPayloadEvent},
     events_wit::PlayerCustomPayloadEventData,
-    permission::{Permission, PermissionDefault, PermissionLevel},
+    permission::{Permission, PermissionChild, PermissionDefault, PermissionLevel},
     player::{JavaKickOptions, Player},
     register_plugin,
     scheduler::SchedulerExt,
@@ -134,20 +134,44 @@ impl Plugin for AxiomPlugin {
 /// Registers every Axiom node so operators can grant them individually. `axiom.all`
 /// defaults to ops, which is what makes the plugin work out of the box for an
 /// opped player — the same contract the Paper plugin documents.
+///
+/// Each node lists everything below it in upstream's tree as a child. Bukkit
+/// follows children all the way down, but Pumpkin resolves them one level deep,
+/// so `axiom.default` has to name every node it grants itself.
 fn register_permissions(context: &Context) {
-    for perm in &permissions::PERMS {
+    for (index, perm) in permissions::PERMS.iter().enumerate() {
         let default = if perm.node == "axiom.all" {
             PermissionDefault::Op(PermissionLevel::Four)
         } else {
             PermissionDefault::Deny
         };
+        let children = descendants(index)
+            .map(|child| PermissionChild {
+                node: permissions::PERMS[child].node.to_owned(),
+                value: true,
+            })
+            .collect();
         let _ = context.register_permission(&Permission {
             node: perm.node.to_owned(),
             description: String::new(),
             default,
-            children: Vec::new(),
+            children,
         });
     }
+}
+
+/// Every node below `ancestor` in the permission tree, at any depth.
+fn descendants(ancestor: usize) -> impl Iterator<Item = usize> {
+    (0..permissions::PERMS.len()).filter(move |&node| {
+        let mut current = node;
+        while let Some(parent) = permissions::PERMS[current].parent {
+            if parent == ancestor {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    })
 }
 
 struct PayloadHandler;
@@ -166,3 +190,55 @@ impl EventHandler<PlayerCustomPayloadEvent> for PayloadHandler {
 }
 
 register_plugin!(AxiomPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index_of(node: &str) -> usize {
+        permissions::PERMS
+            .iter()
+            .position(|perm| perm.node == node)
+            .unwrap()
+    }
+
+    fn child_nodes(node: &str) -> Vec<&'static str> {
+        descendants(index_of(node))
+            .map(|child| permissions::PERMS[child].node)
+            .collect()
+    }
+
+    /// Granting `axiom.default` has to reach the nodes the handlers check, however
+    /// deep they sit, since Pumpkin looks only one level down.
+    #[test]
+    fn default_grants_the_whole_public_set() {
+        let granted = child_nodes("axiom.default");
+        for node in [
+            "axiom.use",
+            "axiom.build.place",
+            "axiom.chunk.request",
+            "axiom.player.gamemode.creative",
+        ] {
+            assert!(granted.contains(&node), "{node}");
+        }
+        assert!(
+            !granted.contains(&"axiom.entity.spawn"),
+            "entities are opt-in"
+        );
+        assert!(!granted.contains(&"axiom.default"));
+    }
+
+    #[test]
+    fn groups_grant_their_members() {
+        assert_eq!(
+            child_nodes("axiom.entity.*"),
+            [
+                "axiom.entity.spawn",
+                "axiom.entity.manipulate",
+                "axiom.entity.delete",
+                "axiom.entity.request_data",
+            ]
+        );
+        assert!(child_nodes("axiom.use").is_empty());
+    }
+}
