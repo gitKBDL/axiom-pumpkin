@@ -7,7 +7,7 @@ Serverside component for [Axiom](https://modrinth.com/mod/axiom) on [Pumpkin](ht
 1. **The plugin:** `axiom.wasm` from the [latest release](https://github.com/gitKBDL/axiom-pumpkin/releases/latest). Put it in the server's `plugins/` folder.
 2. **The server:** the plugin needs a few plugin API additions that upstream Pumpkin does not have yet. Until it does, run the [Pumpkin for Axiom](https://github.com/gitKBDL/Pumpkin-Core/releases) build for your platform, made from the [`axiom` branch](https://github.com/gitKBDL/Pumpkin-Core/tree/axiom) of our fork. On a stock Pumpkin server the plugin will not load.
 
-Players need Minecraft 26.3 with Axiom 6.1 or newer.
+Players need Minecraft 26.3 with Axiom 6.1 or newer. Older versions have to wait for Pumpkin, see the FAQ.
 
 ## FAQ
 
@@ -17,9 +17,9 @@ First, the player must be an op on the server. If the player does not have op pe
 
 If you're using an alternative solution for permission management, you must give players the `axiom.default` permission.
 
-**It says Axiom does not support my Minecraft version.**
+**Can I play on an older Minecraft version, like 1.21.11?**
 
-Pumpkin itself only accepts clients on its own version, 26.3. Older clients can join through [pumpkin-java-multiversion](https://github.com/Pumpkin-MC/pumpkin-java-multiversion), and the plugin translates their block ids, but that plugin cannot yet get them past the configuration phase. Use Minecraft 26.3 for now.
+Not at the moment. Up to its 26.2 release Pumpkin accepted older clients itself, and the plugin worked with them. Since 26.3 Pumpkin only accepts its own version and leaves older ones to [pumpkin-java-multiversion](https://github.com/Pumpkin-MC/pumpkin-java-multiversion), which cannot get them past the configuration phase until Pumpkin hands it those packets too ([Pumpkin#3354](https://github.com/Pumpkin-MC/Pumpkin/pull/3354)). The plugin still translates block ids for older clients, so they will work again once that lands.
 
 **What works?**
 
