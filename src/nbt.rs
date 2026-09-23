@@ -180,7 +180,10 @@ mod tests {
     /// The dictionary has to load, or every block entity in every paste is lost.
     #[test]
     fn embedded_dictionary_loads() {
-        assert!(decoder().is_some(), "block entity dictionary failed to load");
+        assert!(
+            decoder().is_some(),
+            "block entity dictionary failed to load"
+        );
     }
 
     #[test]
@@ -225,7 +228,7 @@ mod tests {
             3, 0, 1, b'a', 0, 0, 0, 1, // int "a" = 1
             9, 0, 1, b'l', 8, 0, 0, 0, 1, 0, 2, b'h', b'i', // list "l" of one string
             7, 0, 1, b'b', 0, 0, 0, 2, 9, 9, // byte array "b" of two bytes
-            0,  // end of compound
+            0, // end of compound
         ];
         let mut trailing = tag.clone();
         trailing.extend_from_slice(b"AFTER");
@@ -272,7 +275,10 @@ mod tests {
         let tag = write_compound(&[field(1, b"a", &[7]), field(8, b"s", &[0, 2, b'h', b'i'])]);
         assert_eq!(write_compound(&read_compound(&tag).unwrap()), tag);
         assert_eq!(read_compound(&[0]), Ok(Vec::new()));
-        assert!(read_compound(&[3, 0, 0, 0, 1]).is_err(), "an int is not a compound");
+        assert!(
+            read_compound(&[3, 0, 0, 0, 1]).is_err(),
+            "an int is not a compound"
+        );
         assert_eq!(string(&read_compound(&tag).unwrap(), b"s"), Some("hi"));
     }
 
@@ -465,7 +471,10 @@ impl<'a> Field<'a> {
 
 /// Replaces the field of the same name, or adds it.
 pub fn put<'a>(fields: &mut Vec<Field<'a>>, field: Field<'a>) {
-    match fields.iter_mut().find(|existing| existing.name == field.name) {
+    match fields
+        .iter_mut()
+        .find(|existing| existing.name == field.name)
+    {
         Some(existing) => *existing = field,
         None => fields.push(field),
     }
@@ -570,13 +579,17 @@ pub fn floats(values: &[f32]) -> Vec<u8> {
 
 /// The value of a byte field, if the compound has one by that name.
 pub fn byte(fields: &[Field<'_>], name: &[u8]) -> Option<u8> {
-    let field = fields.iter().find(|f| f.name == name && f.tag == TAG_BYTE)?;
+    let field = fields
+        .iter()
+        .find(|f| f.name == name && f.tag == TAG_BYTE)?;
     field.payload.first().copied()
 }
 
 /// The value of a string field, if the compound has one by that name.
 pub fn string<'f>(fields: &'f [Field<'_>], name: &[u8]) -> Option<&'f str> {
-    let field = fields.iter().find(|f| f.name == name && f.tag == TAG_STRING)?;
+    let field = fields
+        .iter()
+        .find(|f| f.name == name && f.tag == TAG_STRING)?;
     // Modified UTF-8 only differs from UTF-8 for NUL and astral characters,
     // neither of which appears in the ids this is used for.
     std::str::from_utf8(field.payload.get(2..)?).ok()
@@ -639,10 +652,15 @@ const ALLOWED_ENTITY_KEYS: &[&str] = &[
 /// riding it.
 pub fn sanitize_entity(fields: &mut Vec<Field<'_>>) -> crate::buf::Result<()> {
     fields.retain(|field| {
-        ALLOWED_ENTITY_KEYS.iter().any(|key| key.as_bytes() == field.name)
+        ALLOWED_ENTITY_KEYS
+            .iter()
+            .any(|key| key.as_bytes() == field.name)
             && (field.name != b"Passengers" || field.tag == TAG_LIST)
     });
-    for field in fields.iter_mut().filter(|field| field.name == b"Passengers") {
+    for field in fields
+        .iter_mut()
+        .filter(|field| field.name == b"Passengers")
+    {
         let mut riders = read_compound_list(&field.payload)?;
         let mut sanitized = Vec::with_capacity(riders.len());
         for rider in &mut riders {

@@ -135,65 +135,72 @@ fn take_body<'a>(r: &mut Reader<'a>) -> Result<&'a [u8]> {
 pub fn handle(server: &Server, player: &Player, body: &[u8]) -> core::result::Result<(), String> {
     let err = |e: Error| e.to_string();
     let mut r = Reader::new(body);
-    let count = r.var_len("annotation actions", MAX_ANNOTATIONS).map_err(err)?;
+    let count = r
+        .var_len("annotation actions", MAX_ANNOTATIONS)
+        .map_err(err)?;
 
     let dimension = player.get_world().get_dimension();
     let mut applied = Writer::new();
     let mut applied_count = 0_usize;
 
-    with_world(&dimension, |annotations| -> core::result::Result<(), String> {
-        for _ in 0..count {
-            let action = r.u8().map_err(err)?;
-            let start = r.position();
+    with_world(
+        &dimension,
+        |annotations| -> core::result::Result<(), String> {
+            for _ in 0..count {
+                let action = r.u8().map_err(err)?;
+                let start = r.position();
 
-            match action {
-                0 => {
-                    let uuid = r.uuid().map_err(err)?;
-                    let body = take_body(&mut r).map_err(err)?.to_vec();
-                    if annotations.len() >= MAX_ANNOTATIONS {
-                        continue;
+                match action {
+                    0 => {
+                        let uuid = r.uuid().map_err(err)?;
+                        let body = take_body(&mut r).map_err(err)?.to_vec();
+                        if annotations.len() >= MAX_ANNOTATIONS {
+                            continue;
+                        }
+                        annotations.retain(|a| a.uuid != uuid);
+                        annotations.push(Annotation { uuid, body });
                     }
-                    annotations.retain(|a| a.uuid != uuid);
-                    annotations.push(Annotation { uuid, body });
-                }
-                1 => {
-                    let uuid = r.uuid().map_err(err)?;
-                    annotations.retain(|a| a.uuid != uuid);
-                }
-                2 | 4 => {
-                    let uuid = r.uuid().map_err(err)?;
-                    let width = if action == 2 {
-                        POSITION_BYTES
-                    } else {
-                        ROTATION_BYTES
-                    };
-                    let value = r.take(width).map_err(err)?;
-                    if let Some(annotation) = annotations.iter_mut().find(|a| a.uuid == uuid)
-                        && let Some(offset) = positioned_offset(&annotation.body)
-                    {
-                        let at = if action == 2 {
-                            offset
+                    1 => {
+                        let uuid = r.uuid().map_err(err)?;
+                        annotations.retain(|a| a.uuid != uuid);
+                    }
+                    2 | 4 => {
+                        let uuid = r.uuid().map_err(err)?;
+                        let width = if action == 2 {
+                            POSITION_BYTES
                         } else {
-                            offset + POSITION_BYTES
+                            ROTATION_BYTES
                         };
-                        annotation.body[at..at + width].copy_from_slice(value);
+                        let value = r.take(width).map_err(err)?;
+                        if let Some(annotation) = annotations.iter_mut().find(|a| a.uuid == uuid)
+                            && let Some(offset) = positioned_offset(&annotation.body)
+                        {
+                            let at = if action == 2 {
+                                offset
+                            } else {
+                                offset + POSITION_BYTES
+                            };
+                            annotation.body[at..at + width].copy_from_slice(value);
+                        }
                     }
+                    3 => annotations.clear(),
+                    other => return Err(format!("unknown annotation action: {other}")),
                 }
-                3 => annotations.clear(),
-                other => return Err(format!("unknown annotation action: {other}")),
-            }
 
-            // Relay exactly the bytes we accepted, so every client ends up with the
-            // same state we hold.
-            applied.u8(action).bytes(r.since(start).map_err(err)?);
-            applied_count += 1;
-        }
-        Ok(())
-    })?;
+                // Relay exactly the bytes we accepted, so every client ends up with the
+                // same state we hold.
+                applied.u8(action).bytes(r.since(start).map_err(err)?);
+                applied_count += 1;
+            }
+            Ok(())
+        },
+    )?;
 
     if applied_count > 0 {
         let mut payload = Writer::new();
-        payload.var_i32(applied_count as i32).bytes(&applied.into_vec());
+        payload
+            .var_i32(applied_count as i32)
+            .bytes(&applied.into_vec());
         broadcast(server, &dimension, &payload.into_vec());
     }
     Ok(())
@@ -225,7 +232,6 @@ fn broadcast(server: &Server, dimension: &str, payload: &[u8]) {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

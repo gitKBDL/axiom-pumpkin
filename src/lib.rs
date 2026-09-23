@@ -6,12 +6,15 @@
 //! token back along with its API version. A matching echo enables the client.
 
 mod annotations;
+#[rustfmt::skip] // generated, see tools/
 mod biomes;
+#[rustfmt::skip] // generated, see tools/
 mod block_remap;
 mod buf;
 mod handlers;
 mod nbt;
 mod palette;
+#[rustfmt::skip] // generated, see tools/
 mod permissions;
 mod proto;
 mod tunnel;
@@ -31,7 +34,7 @@ use pumpkin_plugin_api::{
     uuid::Uuid,
 };
 
-use proto::{PlayerState, PlayerKey};
+use proto::{PlayerKey, PlayerState};
 
 /// Axiom's protocol revision. The client refuses to talk to a server that reports
 /// a different one, so this is bumped in lockstep with the upstream plugin.
@@ -40,7 +43,10 @@ pub const API_VERSION: i32 = 10;
 /// Serverbound packets this port understands. Sent verbatim in `axiom:enable`; the
 /// client disables any feature whose packet is missing from the list, so a name is
 /// added here only once its handler exists.
-pub const SUPPORTED_PACKETS: &[&str] = &["axiom:tunnel", "axiom:hello", "axiom:set_block",
+pub const SUPPORTED_PACKETS: &[&str] = &[
+    "axiom:tunnel",
+    "axiom:hello",
+    "axiom:set_block",
     "axiom:set_buffer",
     "axiom:set_gamemode",
     "axiom:set_fly_speed",

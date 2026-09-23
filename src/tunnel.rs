@@ -33,7 +33,10 @@ pub enum Error {
     Decode(buf::Error),
     Zstd(String),
     /// Decompressed body did not match the declared length.
-    SizeMismatch { declared: usize, actual: usize },
+    SizeMismatch {
+        declared: usize,
+        actual: usize,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -46,7 +49,10 @@ impl core::fmt::Display for Error {
             Self::Decode(e) => write!(f, "malformed tunnel packet: {e}"),
             Self::Zstd(e) => write!(f, "zstd failed to decompress: {e}"),
             Self::SizeMismatch { declared, actual } => {
-                write!(f, "uncompressed size didn't match real size ({declared} vs {actual})")
+                write!(
+                    f,
+                    "uncompressed size didn't match real size ({declared} vs {actual})"
+                )
             }
         }
     }
@@ -151,8 +157,8 @@ fn decode(payload: &[u8]) -> Result<Packet, Error> {
 fn zstd_decompress(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
     use std::io::Read;
 
-    let mut decoder = ruzstd::StreamingDecoder::new(input)
-        .map_err(|e| Error::Zstd(e.to_string()))?;
+    let mut decoder =
+        ruzstd::StreamingDecoder::new(input).map_err(|e| Error::Zstd(e.to_string()))?;
 
     let mut out = vec![0_u8; expected];
     let mut filled = 0;
@@ -255,7 +261,11 @@ mod tests {
         let mut t = Tunnel::new();
         // A continuation frame with no FIRST seen yet is dropped, not misparsed.
         assert!(t.push(&[0, 1, 2, 3]).expect("accepted").is_none());
-        assert!(t.push(&[FRAME_FLAG_LAST, 4, 5]).expect("accepted").is_none());
+        assert!(
+            t.push(&[FRAME_FLAG_LAST, 4, 5])
+                .expect("accepted")
+                .is_none()
+        );
 
         let mut frame = vec![FRAME_FLAG_FIRST | FRAME_FLAG_LAST];
         frame.extend_from_slice(&packet("axiom:hello", b"ok"));

@@ -12,9 +12,9 @@ use pumpkin_plugin_api::{
     world::{self, BlockFlags, Chunk, Entity, EntityType, World},
 };
 
+use crate::biomes;
 use crate::block_remap::{self, Tables};
 use crate::buf::{Reader, Writer, pack_block_pos, unpack_block_pos};
-use crate::biomes;
 use crate::nbt;
 use crate::palette::{self, SECTION_VOLUME, index_of};
 use crate::permissions;
@@ -58,7 +58,10 @@ fn apply_block_entity(
     budget: &mut usize,
 ) {
     if entity.dictionary != nbt::SUPPORTED_DICTIONARY {
-        tracing::debug!("Skipping block entity with dictionary {}", entity.dictionary);
+        tracing::debug!(
+            "Skipping block entity with dictionary {}",
+            entity.dictionary
+        );
         return;
     }
     if entity.original_size > *budget {
@@ -213,7 +216,9 @@ pub fn set_block(player: &Player, body: &[u8]) -> Result<(), String> {
     let update_neighbors = r.bool().map_err(err)?;
     let mut prevent_updates_at = Vec::new();
     if update_neighbors {
-        let n = r.var_len("prevent-updates set", MAX_COLLECTION).map_err(err)?;
+        let n = r
+            .var_len("prevent-updates set", MAX_COLLECTION)
+            .map_err(err)?;
         prevent_updates_at.reserve(n);
         for _ in 0..n {
             prevent_updates_at.push(r.block_pos().map_err(err)?);
@@ -250,16 +255,19 @@ pub fn set_block(player: &Player, body: &[u8]) -> Result<(), String> {
     let remap = client_remap(player);
     let mut loaded = LoadedChunks::default();
     for ((x, y, z), state) in blocks {
-        let Some(state) = u16::try_from(state).ok().and_then(|id| server_state(remap, id)) else {
+        let Some(state) = u16::try_from(state)
+            .ok()
+            .and_then(|id| server_state(remap, id))
+        else {
             continue;
         };
         loaded.ensure(&world, x >> 4, z >> 4);
         // Upstream skips neighbour updates for a block adjacent to any position the
         // client asked to leave alone, so a no-update placement cannot be undone by
         // its neighbour's update.
-        let near_protected = prevent_updates_at.iter().any(|&(px, py, pz)| {
-            (px - x).abs() + (py - y).abs() + (pz - z).abs() <= 1
-        });
+        let near_protected = prevent_updates_at
+            .iter()
+            .any(|&(px, py, pz)| (px - x).abs() + (py - y).abs() + (pz - z).abs() <= 1);
         world.set_block_state(
             BlockPos { x, y, z },
             state,
@@ -294,7 +302,7 @@ fn diagnose_first_section(remap: Option<&'static Tables>, declared_bits: u8, ent
             None => counts.push((id, 1)),
         }
     }
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
     // Report ids as the server sees them; the raw wire value is in the client's
     // registry and naming it with our own table is how this looked like a
     // turtle_egg problem the first time round.
@@ -462,7 +470,6 @@ fn apply_block_buffer<'a>(
     }
 }
 
-
 /// `axiom:set_gamemode`
 pub fn set_gamemode(player: &Player, body: &[u8]) -> Result<(), String> {
     let mode = Reader::new(body).u8().map_err(|e| e.to_string())?;
@@ -524,8 +531,18 @@ pub fn set_world_time(player: &Player, body: &[u8]) -> Result<(), String> {
 
     let dimension = r.string().map_err(err)?.to_owned();
     // Both fields are optional; the client sends whichever the user changed.
-    let time = r.bool().map_err(err)?.then(|| r.i32()).transpose().map_err(err)?;
-    let freeze = r.bool().map_err(err)?.then(|| r.bool()).transpose().map_err(err)?;
+    let time = r
+        .bool()
+        .map_err(err)?
+        .then(|| r.i32())
+        .transpose()
+        .map_err(err)?;
+    let freeze = r
+        .bool()
+        .map_err(err)?
+        .then(|| r.bool())
+        .transpose()
+        .map_err(err)?;
 
     if !has_perm(player, permissions::WORLD_TIME) || (time.is_none() && freeze.is_none()) {
         return Ok(());
@@ -646,7 +663,9 @@ pub fn request_chunk_data(player: &Player, body: &[u8]) -> Result<(), String> {
     let dimension = r.string().map_err(err)?.to_owned();
     let _entities_in_chunks = r.bool().map_err(err)?;
 
-    let requested_entities = r.var_len("block entity list", MAX_COLLECTION).map_err(err)?;
+    let requested_entities = r
+        .var_len("block entity list", MAX_COLLECTION)
+        .map_err(err)?;
     let mut entity_positions = Vec::with_capacity(requested_entities);
     for _ in 0..requested_entities {
         entity_positions.push(r.i64().map_err(err)?);
@@ -894,7 +913,12 @@ pub fn request_entity_data(player: &Player, body: &[u8]) -> Result<(), String> {
         let nbt = entity.get_nbt();
         if nbt.len() >= MAX_RESPONSE_BYTES {
             // Too big to share a payload with anything else.
-            send_entity_data(player, id, false, &[(wanted[index].0, wanted[index].1, nbt)]);
+            send_entity_data(
+                player,
+                id,
+                false,
+                &[(wanted[index].0, wanted[index].1, nbt)],
+            );
             continue;
         }
         if batch_bytes + nbt.len() > MAX_RESPONSE_BYTES {
@@ -1055,7 +1079,11 @@ pub fn manipulate_entity(player: &Player, body: &[u8]) -> Result<(), String> {
             }
         }
     }
-    tracing::debug!("Manipulated {} entities for {}", found.len(), player.get_name());
+    tracing::debug!(
+        "Manipulated {} entities for {}",
+        found.len(),
+        player.get_name()
+    );
     Ok(())
 }
 
@@ -1280,7 +1308,11 @@ fn turn_hanging(fields: &mut Vec<nbt::Field<'_>>, yaw: f32) {
     match horizontal {
         Some(h) => {
             let turned = (i32::from(h) + java_round(changed / 90.0)).rem_euclid(4) as usize;
-            let value = if three_d { [3, 4, 2, 5][turned] } else { turned as u8 };
+            let value = if three_d {
+                [3, 4, 2, 5][turned]
+            } else {
+                turned as u8
+            };
             nbt::put(fields, nbt::Field::byte(key, value));
         }
         None => {
@@ -1313,7 +1345,10 @@ fn save_with_riders(entity: &Entity) -> Vec<u8> {
     let Ok(mut fields) = nbt::read_compound(&nbt) else {
         return nbt;
     };
-    nbt::put(&mut fields, nbt::Field::list(b"Passengers", nbt::compound_list(&riders)));
+    nbt::put(
+        &mut fields,
+        nbt::Field::list(b"Passengers", nbt::compound_list(&riders)),
+    );
     nbt::write_compound(&fields)
 }
 
@@ -1347,8 +1382,7 @@ pub fn tick_blocks(player: &Player, body: &[u8]) -> Result<(), String> {
         0 => {
             let sections = r.var_len("position set", MAX_COLLECTION).map_err(err)?;
             for _ in 0..sections {
-                let (section_x, section_y, section_z) =
-                    unpack_block_pos(r.i64().map_err(err)?);
+                let (section_x, section_y, section_z) = unpack_block_pos(r.i64().map_err(err)?);
                 // 256 rows of 16 X bits each, ordered z then y.
                 for index in 0..256_usize {
                     let mask = r.i16().map_err(err)? as u16;
@@ -1399,7 +1433,8 @@ pub fn tick_blocks(player: &Player, body: &[u8]) -> Result<(), String> {
 
     // Writing a block back as itself is what runs the neighbour-update machinery;
     // FORCE_STATE is needed precisely because the state does not change.
-    let flags = BlockFlags::NOTIFY_NEIGHBORS | BlockFlags::NOTIFY_LISTENERS | BlockFlags::FORCE_STATE;
+    let flags =
+        BlockFlags::NOTIFY_NEIGHBORS | BlockFlags::NOTIFY_LISTENERS | BlockFlags::FORCE_STATE;
     for (x, y, z) in &positions {
         let pos = BlockPos {
             x: *x,
@@ -1421,7 +1456,11 @@ pub fn tick_blocks(player: &Player, body: &[u8]) -> Result<(), String> {
             false,
         );
     }
-    tracing::debug!("Ticked {} blocks for {}", positions.len(), player.get_name());
+    tracing::debug!(
+        "Ticked {} blocks for {}",
+        positions.len(),
+        player.get_name()
+    );
     Ok(())
 }
 
@@ -1438,11 +1477,19 @@ mod tests {
     fn older_client_ids_translate_to_the_server_registry() {
         let tables = tables_for(JavaMinecraftVersion::V1219).expect("1.21.9 needs translation");
         assert_eq!(to_server(tables.to_server, 15090), Some(18649), "void_air");
-        assert_eq!(to_server(tables.to_server, 1), Some(1), "stone is unchanged");
+        assert_eq!(
+            to_server(tables.to_server, 1),
+            Some(1),
+            "stone is unchanged"
+        );
         assert_eq!(to_server(tables.to_server, 0), Some(0), "air is unchanged");
         // And back again, for ids we send to the client.
         assert_eq!(to_client(tables.to_client, 18649), Some(15090), "void_air");
-        assert_eq!(to_client(tables.to_client, 1), Some(1), "stone is unchanged");
+        assert_eq!(
+            to_client(tables.to_client, 1),
+            Some(1),
+            "stone is unchanged"
+        );
 
         // 26.2 is one release behind, and its ids have already moved.
         let tables = tables_for(JavaMinecraftVersion::V262).expect("26.2 needs translation");
@@ -1476,15 +1523,36 @@ mod tests {
     #[test]
     fn hanging_entities_turn_with_the_paste() {
         // A painting facing south (yaw 0) pasted at yaw 90 now faces west.
-        assert_eq!(turned(&hanging("minecraft:painting", b"facing", 0), 90.0, b"facing"), Some(1));
+        assert_eq!(
+            turned(
+                &hanging("minecraft:painting", b"facing", 0),
+                90.0,
+                b"facing"
+            ),
+            Some(1)
+        );
         // An item frame facing north (yaw 180) pasted at yaw 270 now faces east.
-        assert_eq!(turned(&hanging("minecraft:item_frame", b"Facing", 2), 270.0, b"Facing"), Some(5));
+        assert_eq!(
+            turned(
+                &hanging("minecraft:item_frame", b"Facing", 2),
+                270.0,
+                b"Facing"
+            ),
+            Some(5)
+        );
         // A painting with no facing at all starts from south, as it loads.
-        assert_eq!(turned(&hanging("painting", b"x", 0), 180.0, b"facing"), Some(2));
+        assert_eq!(
+            turned(&hanging("painting", b"x", 0), 180.0, b"facing"),
+            Some(2)
+        );
         // A frame lying on the floor turns its item, an eighth per 45 degrees.
         let flat = hanging("glow_item_frame", b"Facing", 1);
         assert_eq!(turned(&flat, 90.0, b"ItemRotation"), Some(6));
-        assert_eq!(turned(&flat, 90.0, b"Facing"), Some(1), "the side it faces stays");
+        assert_eq!(
+            turned(&flat, 90.0, b"Facing"),
+            Some(1),
+            "the side it faces stays"
+        );
     }
 
     #[test]

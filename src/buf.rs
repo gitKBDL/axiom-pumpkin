@@ -155,11 +155,7 @@ impl<'a> Reader<'a> {
     /// than wrapping into a huge `usize`.
     pub fn var_len(&mut self, what: &'static str, max: usize) -> Result<usize> {
         let raw = self.var_i32()?;
-        let len = usize::try_from(raw).map_err(|_| Error::TooLarge {
-            what,
-            len: 0,
-            max,
-        })?;
+        let len = usize::try_from(raw).map_err(|_| Error::TooLarge { what, len: 0, max })?;
         if len > max {
             return Err(Error::TooLarge { what, len, max });
         }
@@ -360,13 +356,24 @@ mod tests {
     fn block_pos_packing_matches_vanilla() {
         const MIN_POSITION_LONG: i64 =
             0b1000000000000000000000000010000000000000000000000000100000000000_u64 as i64;
-        assert_eq!(pack_block_pos(-33_554_432, -2048, -33_554_432), MIN_POSITION_LONG);
-        assert_eq!(unpack_block_pos(MIN_POSITION_LONG), (-33_554_432, -2048, -33_554_432));
+        assert_eq!(
+            pack_block_pos(-33_554_432, -2048, -33_554_432),
+            MIN_POSITION_LONG
+        );
+        assert_eq!(
+            unpack_block_pos(MIN_POSITION_LONG),
+            (-33_554_432, -2048, -33_554_432)
+        );
     }
 
     #[test]
     fn block_pos_roundtrips_signed_components() {
-        for pos in [(0, 0, 0), (1, -1, 1), (-30_000_000, 319, 30_000_000), (17, -64, -17)] {
+        for pos in [
+            (0, 0, 0),
+            (1, -1, 1),
+            (-30_000_000, 319, 30_000_000),
+            (17, -64, -17),
+        ] {
             let (x, y, z) = pos;
             assert_eq!(unpack_block_pos(pack_block_pos(x, y, z)), pos);
         }

@@ -170,7 +170,10 @@ mod tests {
 
     fn roundtrip(entries: &[u16]) {
         let mut w = Writer::new();
-        assert!(write_section_indirect(&mut w, entries), "palette should fit");
+        assert!(
+            write_section_indirect(&mut w, entries),
+            "palette should fit"
+        );
         let bytes = w.into_vec();
         let decoded = read_section(&mut Reader::new(&bytes), DIRECT_BITS).expect("decodes");
         assert_eq!(decoded, entries);
@@ -179,7 +182,9 @@ mod tests {
     #[test]
     fn indirect_palette_roundtrips() {
         // 200 distinct states, so the palette needs the full 8 bits.
-        let entries: Vec<u16> = (0..SECTION_VOLUME).map(|i| (i % 200 + 15_000) as u16).collect();
+        let entries: Vec<u16> = (0..SECTION_VOLUME)
+            .map(|i| (i % 200 + 15_000) as u16)
+            .collect();
         roundtrip(&entries);
     }
 

@@ -213,7 +213,11 @@ fn top_up_dispatch_sends(player: &Player, state: &mut PlayerState) {
 fn send_dispatch_update(player: &Player, add: i32, max: i32) {
     let mut w = Writer::new();
     w.var_i32(add).var_i32(max);
-    send(player, "axiom:update_available_dispatch_sends", &w.into_vec());
+    send(
+        player,
+        "axiom:update_available_dispatch_sends",
+        &w.into_vec(),
+    );
 }
 
 /// Charges a block buffer against the player's budget and re-syncs with what the
@@ -322,12 +326,18 @@ fn dispatch(server: &Server, player: &Player, id: &str, body: &[u8]) {
         // implements. Upstream kicks; ignoring is friendlier and equally safe,
         // because nothing was applied.
         _ => {
-            tracing::debug!("Ignoring unimplemented Axiom packet {id} ({} bytes)", body.len());
+            tracing::debug!(
+                "Ignoring unimplemented Axiom packet {id} ({} bytes)",
+                body.len()
+            );
             return;
         }
     };
     if let Err(reason) = result {
-        kick(player, &format!("Axiom: error while processing {id}: {reason}"));
+        kick(
+            player,
+            &format!("Axiom: error while processing {id}: {reason}"),
+        );
     }
 }
 
@@ -344,7 +354,9 @@ fn handle_hello(player: &Player, body: &[u8]) -> Result<(), String> {
     if api_version != API_VERSION {
         let versions = format!(" (C={api_version} S={API_VERSION})");
         let message = if api_version < API_VERSION {
-            format!("Unable to use Axiom, you're on an outdated version! Please update to the latest version of Axiom to use it on this server.{versions}")
+            format!(
+                "Unable to use Axiom, you're on an outdated version! Please update to the latest version of Axiom to use it on this server.{versions}"
+            )
         } else {
             format!("Unable to use Axiom, server hasn't updated Axiom yet.{versions}")
         };
@@ -377,7 +389,10 @@ fn handle_hello(player: &Player, body: &[u8]) -> Result<(), String> {
         let version = java.get_version();
         version != SERVER_VERSION && crate::block_remap::tables_for(version).is_none()
     }) {
-        send_goodbye(player, "Axiom does not support this Minecraft version on this server");
+        send_goodbye(
+            player,
+            "Axiom does not support this Minecraft version on this server",
+        );
         return Ok(());
     }
 
