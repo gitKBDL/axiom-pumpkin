@@ -10,7 +10,7 @@ Builds to a WebAssembly component. Drop `axiom.wasm` into the server's
 ## Requires a patched server
 
 This needs plugin API additions that are not in upstream Pumpkin yet, on the
-`axiom-plugin-api` branch of the checkout next to this one:
+`axiom-plugin-api` branch of [gitKBDL/Pumpkin-Core](https://github.com/gitKBDL/Pumpkin-Core):
 
 - `chunk.read-section` — a whole section in one call. Reading one block at a
   time costs a host call per block, which dominates any bulk operation.
@@ -31,23 +31,19 @@ cp target/wasm32-wasip2/release/axiom_pumpkin.wasm /path/to/server/plugins/axiom
 
 ## Generated sources
 
-Three modules are generated and must not be edited by hand:
+Two modules are generated and must not be edited by hand:
 
 - `src/permissions.rs` — Axiom's permission nodes, from the upstream Java enum.
   `tools/gen_permissions.py ../axiom-java-reference > src/permissions.rs`
-- `src/block_remap.rs` and `assets/remap/` — block state id translation for
-  clients older than the server, from Pumpkin's own remap tables.
-  `tools/gen_block_remap.py ../pumpkin-src > src/block_remap.rs`
 - `src/biomes.rs` — biome lookup by registry name.
   `tools/gen_biomes.py ../pumpkin-src > src/biomes.rs`
 
 ## Client versions
 
-Pumpkin serves clients older than itself and remaps block state ids in the
-chunk data it sends, but plugin messages pass through untouched — so an older
-client's Axiom packets arrive in *its* registry, where the same number means a
-different block. Ids are translated in both directions here, which is the job
-upstream delegates to ViaVersion.
+Axiom works for clients on the server's own Minecraft version, 26.3. Pumpkin
+lets older clients in only through a multi-version plugin, and their Axiom
+packets carry block ids from the older registry, where the same number names
+a different block — so Axiom stays off for them rather than corrupting builds.
 
 ## Status
 

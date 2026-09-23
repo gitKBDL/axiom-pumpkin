@@ -2,7 +2,11 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pumpkin_plugin_api::{Server, permission::PermissionLevel, player::Player};
+use pumpkin_plugin_api::{
+    Server,
+    permission::PermissionLevel,
+    player::{JavaMinecraftVersion, Player},
+};
 
 use crate::buf::{Reader, Writer};
 use crate::permissions::{self, PERMS};
@@ -19,6 +23,12 @@ const INFINITE_REACH_LIMIT: i32 = 256;
 /// buffer it sends and stops sending once it runs out, so the server has to keep
 /// topping it up — without that, only the first buffer of an edit ever arrives.
 const DISPATCH_SENDS_PER_SECOND: i32 = 1024;
+
+/// The newest version in the plugin API this is built against, and the only one
+/// Pumpkin accepts on its own. An older client gets in only through a multi-version
+/// plugin, and its Axiom packets would carry block ids from its own registry: the
+/// mismatch that once filled untouched blocks with turtle eggs.
+const SERVER_VERSION: JavaMinecraftVersion = JavaMinecraftVersion::V263;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
@@ -323,8 +333,6 @@ fn handle_hello(player: &Player, body: &[u8]) -> Result<(), String> {
     let mut r = Reader::new(body);
     let api_version = r.var_i32().map_err(|e| e.to_string())?;
     let _data_version = r.var_i32().map_err(|e| e.to_string())?;
-    // Pumpkin rejects mismatched protocol versions at login and has no ViaVersion
-    // equivalent, so a connected client always matches the server here.
     let _protocol_version = r.var_i32().map_err(|e| e.to_string())?;
     let token = r.i64().map_err(|e| e.to_string())?;
     if !r.is_empty() {
@@ -361,6 +369,13 @@ fn handle_hello(player: &Player, body: &[u8]) -> Result<(), String> {
     }
     if !can_use_axiom(player) {
         send_goodbye(player, "Missing axiom.use permission");
+        return Ok(());
+    }
+    if player
+        .as_java()
+        .is_some_and(|java| java.get_version() != SERVER_VERSION)
+    {
+        send_goodbye(player, "Axiom needs the same Minecraft version as the server");
         return Ok(());
     }
 
@@ -407,6 +422,5 @@ fn activate(player: &Player) {
     // finish opening its editor UI.
     send(player, "axiom:register_world_properties", &[0]);
 
-    let translated = crate::handlers::describe_client_registry(player);
-    tracing::info!("Axiom enabled for {} ({translated})", player.get_name());
+    tracing::info!("Axiom enabled for {}", player.get_name());
 }

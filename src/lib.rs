@@ -7,7 +7,6 @@
 
 mod annotations;
 mod biomes;
-mod block_remap;
 mod buf;
 mod handlers;
 mod nbt;

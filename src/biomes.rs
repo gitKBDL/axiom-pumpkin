@@ -17,6 +17,7 @@ pub fn from_name(name: &str) -> Option<Biome> {
         "cherry_grove" => Biome::CherryGrove,
         "cold_ocean" => Biome::ColdOcean,
         "crimson_forest" => Biome::CrimsonForest,
+        "dappled_forest" => Biome::DappledForest,
         "dark_forest" => Biome::DarkForest,
         "deep_cold_ocean" => Biome::DeepColdOcean,
         "deep_dark" => Biome::DeepDark,
