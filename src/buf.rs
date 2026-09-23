@@ -28,6 +28,8 @@ pub enum Error {
     },
     /// Handler finished before consuming the whole packet.
     Trailing(usize),
+    /// Well-formed bytes that are not the value the field needs.
+    Unexpected(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -40,6 +42,7 @@ impl fmt::Display for Error {
                 write!(f, "{what} too large: {len} > {max}")
             }
             Self::Trailing(n) => write!(f, "{n} trailing bytes left unread"),
+            Self::Unexpected(what) => f.write_str(what),
         }
     }
 }

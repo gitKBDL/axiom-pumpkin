@@ -305,6 +305,7 @@ fn dispatch(server: &Server, player: &Player, id: &str, body: &[u8]) {
         "axiom:set_world_time" => crate::handlers::set_world_time(player, body),
         "axiom:set_no_physical_trigger" => crate::handlers::set_no_physical_trigger(player, body),
         "axiom:request_chunk_data" => crate::handlers::request_chunk_data(player, body),
+        "axiom:spawn_entity" => crate::handlers::spawn_entity(player, body),
         "axiom:delete_entity" => crate::handlers::delete_entity(player, body),
         "axiom:request_entity_data" => crate::handlers::request_entity_data(player, body),
         "axiom:manipulate_entity" => crate::handlers::manipulate_entity(player, body),

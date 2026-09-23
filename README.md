@@ -49,15 +49,16 @@ a different block — so Axiom stays off for them rather than corrupting builds.
 
 Working: the handshake and permission model, the `axiom:tunnel` transport,
 individual block placement, section buffers (brushes, shapes, paste), block
-entity NBT, biome painting, chunk data requests, entity delete / manipulate /
-data requests, block ticking, shared annotations, and the player and world
-controls (game mode, fly speed, teleport, time).
+entity NBT, biome painting, chunk data requests, entity spawn / delete /
+manipulate / data requests, block ticking, shared annotations, and the player
+and world controls (game mode, fly speed, teleport, time).
+
+Entity NBT from the client is filtered through the same allow-list upstream
+uses, so the entity tools cannot hand out items, health or anything else a
+saved entity carries.
 
 Not implemented:
 
-- **Entity spawning.** Axiom assigns a new entity a UUID and then moves and
-  deletes it by that UUID; `spawn-entity-from-nbt` has no way to set one, so
-  this needs one more plugin API addition.
 - **Blueprints and world properties.** Both are off by default upstream;
   world properties and the custom block and display APIs exist for other
   plugins to build on, and there are none here yet.

@@ -6,9 +6,7 @@
 //! knob — a blob compressed with it cannot be read without it — so it is embedded
 //! here verbatim from the upstream plugin's resources.
 
-// The tag scanner is groundwork for the entity packets and has no caller yet.
-#![allow(dead_code)]
-
+use std::borrow::Cow;
 use std::sync::{Mutex, OnceLock};
 
 use ruzstd::FrameDecoder;
@@ -254,6 +252,75 @@ mod tests {
         assert!(take_network_tag(&mut Reader::new(&[99])).is_err());
     }
 
+    fn field<'a>(tag: u8, name: &'a [u8], payload: &'a [u8]) -> Field<'a> {
+        Field {
+            tag,
+            name,
+            payload: Cow::Borrowed(payload),
+        }
+    }
+
+    fn names(fields: &[Field<'_>]) -> Vec<String> {
+        fields
+            .iter()
+            .map(|f| String::from_utf8_lossy(f.name).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn compounds_round_trip_and_an_absent_tag_is_empty() {
+        let tag = write_compound(&[field(1, b"a", &[7]), field(8, b"s", &[0, 2, b'h', b'i'])]);
+        assert_eq!(write_compound(&read_compound(&tag).unwrap()), tag);
+        assert_eq!(read_compound(&[0]), Ok(Vec::new()));
+        assert!(read_compound(&[3, 0, 0, 0, 1]).is_err(), "an int is not a compound");
+        assert_eq!(string(&read_compound(&tag).unwrap(), b"s"), Some("hi"));
+    }
+
+    /// Anything outside upstream's allow-list is dropped, riders included.
+    #[test]
+    fn sanitizing_keeps_only_allowed_keys_at_every_level() {
+        let rider = write_compound(&[field(1, b"Glowing", &[1]), field(6, b"Health", &[0; 8])]);
+        let riders = compound_list(&[rider]);
+        let tag = write_compound(&[
+            field(8, b"id", &[0, 3, b'p', b'i', b'g']),
+            field(5, b"Health", &[0; 4]),
+            field(9, b"Passengers", &riders),
+        ]);
+        let mut fields = read_compound(&tag).unwrap();
+        sanitize_entity(&mut fields).unwrap();
+        assert_eq!(names(&fields), ["id", "Passengers"]);
+        let riders = read_compound_list(&fields[1].payload).unwrap();
+        assert_eq!(riders.len(), 1);
+        assert_eq!(names(&riders[0]), ["Glowing"]);
+    }
+
+    #[test]
+    fn merging_recurses_into_compounds_and_an_empty_one_removes_the_key() {
+        let pose = write_compound(&[field(1, b"Head", &[1]), field(1, b"Body", &[2])]);
+        let brightness = write_compound(&[field(3, b"sky", &[0, 0, 0, 15])]);
+        let current = write_compound(&[
+            field(10, b"Pose", &pose[1..]),
+            field(10, b"brightness", &brightness[1..]),
+            field(1, b"Small", &[0]),
+        ]);
+        let head_only = write_compound(&[field(1, b"Head", &[9])]);
+        let changes = write_compound(&[
+            field(10, b"Pose", &head_only[1..]),
+            field(10, b"brightness", &[0]),
+            field(1, b"Small", &[1]),
+            field(1, b"Glowing", &[1]),
+        ]);
+
+        let mut fields = read_compound(&current).unwrap();
+        merge(&mut fields, read_compound(&changes).unwrap()).unwrap();
+        assert_eq!(names(&fields), ["Pose", "Small", "Glowing"]);
+        assert_eq!(fields[1].payload.as_ref(), &[1]);
+
+        // The limb that was not edited keeps its pose.
+        let pose = read_fields(&mut crate::buf::Reader::new(&fields[0].payload)).unwrap();
+        assert_eq!(pose, [field(1, b"Head", &[9]), field(1, b"Body", &[2])]);
+    }
+
     /// And the decompressor we use for inbound data must accept them too, since
     /// that is the path a round trip through the client would take.
     #[test]
@@ -358,4 +425,265 @@ fn array_len(r: &mut crate::buf::Reader<'_>) -> crate::buf::Result<usize> {
         len: 0,
         max: i32::MAX as usize,
     })
+}
+
+const TAG_BYTE: u8 = 1;
+const TAG_FLOAT: u8 = 5;
+const TAG_DOUBLE: u8 = 6;
+const TAG_STRING: u8 = 8;
+const TAG_LIST: u8 = 9;
+const TAG_COMPOUND: u8 = 10;
+
+/// One named value of a compound: its tag type, its name and its payload.
+///
+/// Payloads stay borrowed from the packet unless an edit replaces them, so
+/// filtering a tag copies only what it writes back out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field<'a> {
+    pub tag: u8,
+    pub name: &'a [u8],
+    pub payload: Cow<'a, [u8]>,
+}
+
+impl<'a> Field<'a> {
+    pub const fn list(name: &'a [u8], payload: Vec<u8>) -> Self {
+        Self {
+            tag: TAG_LIST,
+            name,
+            payload: Cow::Owned(payload),
+        }
+    }
+
+    pub fn byte(name: &'a [u8], value: u8) -> Self {
+        Self {
+            tag: TAG_BYTE,
+            name,
+            payload: Cow::Owned(vec![value]),
+        }
+    }
+}
+
+/// Replaces the field of the same name, or adds it.
+pub fn put<'a>(fields: &mut Vec<Field<'a>>, field: Field<'a>) {
+    match fields.iter_mut().find(|existing| existing.name == field.name) {
+        Some(existing) => *existing = field,
+        None => fields.push(field),
+    }
+}
+
+/// Splits one network-form compound into its fields. A lone `TAG_End`, which is
+/// how the protocol writes "no tag", reads as an empty compound.
+pub fn read_compound(tag: &[u8]) -> crate::buf::Result<Vec<Field<'_>>> {
+    let mut r = crate::buf::Reader::new(tag);
+    let fields = match r.u8()? {
+        0 => Vec::new(),
+        TAG_COMPOUND => read_fields(&mut r)?,
+        _ => return Err(crate::buf::Error::Unexpected("nbt root is not a compound")),
+    };
+    r.expect_fully_read()?;
+    Ok(fields)
+}
+
+/// Reads a compound's payload up to and including its `TAG_End`.
+fn read_fields<'a>(r: &mut crate::buf::Reader<'a>) -> crate::buf::Result<Vec<Field<'a>>> {
+    let mut fields = Vec::new();
+    loop {
+        let tag = r.u8()?;
+        if tag == 0 {
+            return Ok(fields);
+        }
+        let name_len = usize::from(r.u16()?);
+        let name = r.take(name_len)?;
+        let start = r.position();
+        skip_payload(r, tag, 1)?;
+        fields.push(Field {
+            tag,
+            name,
+            payload: Cow::Borrowed(r.since(start)?),
+        });
+    }
+}
+
+/// The inverse of [`read_compound`].
+pub fn write_compound(fields: &[Field<'_>]) -> Vec<u8> {
+    let mut out = vec![TAG_COMPOUND];
+    write_fields(&mut out, fields);
+    out
+}
+
+fn write_fields(out: &mut Vec<u8>, fields: &[Field<'_>]) {
+    for field in fields {
+        out.push(field.tag);
+        out.extend_from_slice(&(field.name.len() as u16).to_be_bytes());
+        out.extend_from_slice(field.name);
+        out.extend_from_slice(&field.payload);
+    }
+    out.push(0);
+}
+
+/// Splits a list payload into its compounds. A list of anything else holds no
+/// entities, so it reads as empty.
+pub fn read_compound_list(payload: &[u8]) -> crate::buf::Result<Vec<Vec<Field<'_>>>> {
+    let mut r = crate::buf::Reader::new(payload);
+    let element = r.u8()?;
+    let len = array_len(&mut r)?;
+    let mut compounds = Vec::new();
+    if element == TAG_COMPOUND {
+        for _ in 0..len {
+            compounds.push(read_fields(&mut r)?);
+        }
+    }
+    r.expect_fully_read()?;
+    Ok(compounds)
+}
+
+/// A list payload of the given compounds, each as [`write_compound`] produces it.
+pub fn compound_list(compounds: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = vec![TAG_COMPOUND];
+    out.extend_from_slice(&(compounds.len() as i32).to_be_bytes());
+    for compound in compounds {
+        // List elements carry no type byte of their own.
+        out.extend_from_slice(&compound[1..]);
+    }
+    out
+}
+
+/// A list payload of doubles, the shape of `Pos`.
+pub fn doubles(values: &[f64]) -> Vec<u8> {
+    let mut out = vec![TAG_DOUBLE];
+    out.extend_from_slice(&(values.len() as i32).to_be_bytes());
+    for value in values {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+    out
+}
+
+/// A list payload of floats, the shape of `Rotation`.
+pub fn floats(values: &[f32]) -> Vec<u8> {
+    let mut out = vec![TAG_FLOAT];
+    out.extend_from_slice(&(values.len() as i32).to_be_bytes());
+    for value in values {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+    out
+}
+
+/// The value of a byte field, if the compound has one by that name.
+pub fn byte(fields: &[Field<'_>], name: &[u8]) -> Option<u8> {
+    let field = fields.iter().find(|f| f.name == name && f.tag == TAG_BYTE)?;
+    field.payload.first().copied()
+}
+
+/// The value of a string field, if the compound has one by that name.
+pub fn string<'f>(fields: &'f [Field<'_>], name: &[u8]) -> Option<&'f str> {
+    let field = fields.iter().find(|f| f.name == name && f.tag == TAG_STRING)?;
+    // Modified UTF-8 only differs from UTF-8 for NUL and astral characters,
+    // neither of which appears in the ids this is used for.
+    std::str::from_utf8(field.payload.get(2..)?).ok()
+}
+
+/// Root keys a client may set on an entity, from upstream's `NbtSanitization`.
+/// Anything else a saved entity carries — health, inventories, attributes, AI
+/// state — is dropped, so the entity tools cannot be used to hand those out.
+const ALLOWED_ENTITY_KEYS: &[&str] = &[
+    "id",
+    // Any entity.
+    "Pos",
+    "Rotation",
+    "Invulnerable",
+    "CustomName",
+    "CustomNameVisible",
+    "Silent",
+    "NoGravity",
+    "Glowing",
+    "Tags",
+    "Passengers",
+    // Armor stands.
+    "ArmorItems",
+    "HandItems",
+    "Small",
+    "ShowArms",
+    "DisabledSlots",
+    "NoBasePlate",
+    "Marker",
+    "Pose",
+    // Markers.
+    "data",
+    // Display entities.
+    "transformation",
+    "interpolation_duration",
+    "start_interpolation",
+    "teleport_duration",
+    "billboard",
+    "view_range",
+    "shadow_radius",
+    "shadow_strength",
+    "width",
+    "height",
+    "glow_color_override",
+    "brightness",
+    "line_width",
+    "text_opacity",
+    "background",
+    "shadow",
+    "see_through",
+    "default_background",
+    "alignment",
+    "text",
+    "block_state",
+    "item",
+    "item_display",
+];
+
+/// Drops every field a client may not set, from the entity and from everything
+/// riding it.
+pub fn sanitize_entity(fields: &mut Vec<Field<'_>>) -> crate::buf::Result<()> {
+    fields.retain(|field| {
+        ALLOWED_ENTITY_KEYS.iter().any(|key| key.as_bytes() == field.name)
+            && (field.name != b"Passengers" || field.tag == TAG_LIST)
+    });
+    for field in fields.iter_mut().filter(|field| field.name == b"Passengers") {
+        let mut riders = read_compound_list(&field.payload)?;
+        let mut sanitized = Vec::with_capacity(riders.len());
+        for rider in &mut riders {
+            sanitize_entity(rider)?;
+            sanitized.push(write_compound(rider));
+        }
+        field.payload = Cow::Owned(compound_list(&sanitized));
+    }
+    Ok(())
+}
+
+/// Merges `right` into `left` the way upstream's entity editor does: compounds
+/// merge key by key, an empty compound removes the key, and any other value
+/// replaces what was there.
+///
+/// Replacing a nested compound outright would reset what the edit left out — a
+/// pose for one armor stand limb would put the other limbs back to default.
+pub fn merge<'a>(left: &mut Vec<Field<'a>>, right: Vec<Field<'a>>) -> crate::buf::Result<()> {
+    for field in right {
+        let existing = left.iter().position(|l| l.name == field.name);
+        if field.tag == TAG_COMPOUND {
+            let changes = read_fields(&mut crate::buf::Reader::new(&field.payload))?;
+            if changes.is_empty() {
+                if let Some(index) = existing {
+                    left.remove(index);
+                }
+                continue;
+            }
+            if let Some(index) = existing.filter(|&index| left[index].tag == TAG_COMPOUND) {
+                let mut child = read_fields(&mut crate::buf::Reader::new(&left[index].payload))?;
+                merge(&mut child, changes)?;
+                let mut payload = Vec::new();
+                write_fields(&mut payload, &child);
+                left[index].payload = Cow::Owned(payload);
+                continue;
+            }
+        }
+        match existing {
+            Some(index) => left[index] = field,
+            None => left.push(field),
+        }
+    }
+    Ok(())
 }

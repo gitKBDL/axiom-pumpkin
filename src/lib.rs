@@ -47,6 +47,7 @@ pub const SUPPORTED_PACKETS: &[&str] = &["axiom:tunnel", "axiom:hello", "axiom:s
     "axiom:set_world_time",
     "axiom:set_no_physical_trigger",
     "axiom:request_chunk_data",
+    "axiom:spawn_entity",
     "axiom:delete_entity",
     "axiom:request_entity_data",
     "axiom:manipulate_entity",

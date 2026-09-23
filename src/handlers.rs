@@ -8,6 +8,7 @@ use pumpkin_plugin_api::{
     java_packets::{CAcknowledgeBlockChange, ClientboundPacket},
     player::Player,
     text::TextComponent,
+    uuid::Uuid,
     world::{self, BlockFlags, Chunk, Entity, EntityType, World},
 };
 
@@ -775,8 +776,7 @@ pub fn delete_entity(player: &Player, body: &[u8]) -> Result<(), String> {
     let world = player.get_world();
     let mut removed = 0_usize;
     for (_, entity) in entities_by_uuid(&world, &wanted) {
-        // Removing a player, or a vehicle carrying one, is never what the tool means.
-        if entity.get_type() == EntityType::Player {
+        if !is_editable(&entity) {
             continue;
         }
         entity.remove();
@@ -895,18 +895,24 @@ pub fn manipulate_entity(player: &Player, body: &[u8]) -> Result<(), String> {
     let found = entities_by_uuid(&world, &wanted);
 
     for (index, entity) in &found {
-        if entity.get_type() == EntityType::Player {
+        if !is_editable(entity) {
             continue;
         }
         let entry = &entries[*index];
 
         // An empty tag is a single TAG_End byte and means "no NBT change".
-        // Pumpkin reads only the fields the NBT mentions, which is the merge
-        // upstream builds by hand.
-        if entry.merge.len() > 1
-            && let Err(e) = entity.set_nbt(entry.merge)
-        {
-            tracing::debug!("Entity NBT rejected: {e}");
+        if entry.merge.len() > 1 {
+            let mut changes = nbt::read_compound(entry.merge).map_err(err)?;
+            nbt::sanitize_entity(&mut changes).map_err(err)?;
+            // Upstream puts the entity back where it was after loading the merge;
+            // moving it is what the movement fields are for.
+            changes.retain(|field| field.name != b"Pos");
+            let current = entity.get_nbt();
+            let mut fields = nbt::read_compound(&current).map_err(err)?;
+            nbt::merge(&mut fields, changes).map_err(err)?;
+            if let Err(e) = entity.set_nbt(&nbt::write_compound(&fields)) {
+                tracing::debug!("Entity NBT rejected: {e}");
+            }
         }
 
         if let Some((flags, x, y, z, yaw, pitch)) = entry.movement {
@@ -939,17 +945,27 @@ pub fn manipulate_entity(player: &Player, body: &[u8]) -> Result<(), String> {
             entity.set_rotation(yaw, pitch);
         }
 
+        if !can_ride(entity) {
+            continue;
+        }
         match &entry.passengers {
             PassengerChange::None => {}
             PassengerChange::RemoveAll => entity.eject_passengers(),
             PassengerChange::Add(list) => {
                 for (_, passenger) in entities_by_uuid(&world, list) {
-                    entity.add_passenger(passenger);
+                    if passenger.get_vehicle().is_none()
+                        && can_move_stack(&passenger)
+                        && !rides_on(entity, passenger.get_id())
+                    {
+                        entity.add_passenger(passenger);
+                    }
                 }
             }
             PassengerChange::Remove(list) => {
                 for (_, passenger) in entities_by_uuid(&world, list) {
-                    entity.remove_passenger(passenger);
+                    if can_move_stack(&passenger) {
+                        entity.remove_passenger(passenger);
+                    }
                 }
             }
         }
@@ -963,6 +979,267 @@ enum PassengerChange {
     RemoveAll,
     Add(Vec<(u64, u64)>),
     Remove(Vec<(u64, u64)>),
+}
+
+/// Upstream keeps the entity tools away from players, and from anything a player
+/// is riding.
+fn is_editable(entity: &Entity) -> bool {
+    entity.get_type() != EntityType::Player
+        && entity
+            .get_passengers()
+            .iter()
+            .all(|rider| rider.get_type() != EntityType::Player)
+}
+
+/// Whether an entity may carry riders or be seated, as upstream decides it: never
+/// a player, and never a marker, which exists only as data.
+fn can_ride(entity: &Entity) -> bool {
+    !matches!(entity.get_type(), EntityType::Player | EntityType::Marker)
+}
+
+/// Whether an entity can be seated or unseated along with its own riders.
+fn can_move_stack(entity: &Entity) -> bool {
+    can_ride(entity) && entity.get_passengers().iter().all(can_ride)
+}
+
+/// Whether `entity` is the entity with id `other` or sits somewhere on top of it,
+/// in which case seating `other` on `entity` would close a loop.
+fn rides_on(entity: &Entity, other: u32) -> bool {
+    if entity.get_id() == other {
+        return true;
+    }
+    let mut vehicle = entity.get_vehicle();
+    while let Some(current) = vehicle {
+        if current.get_id() == other {
+            return true;
+        }
+        vehicle = current.get_vehicle();
+    }
+    false
+}
+
+/// `axiom:spawn_entity` — entities placed with the entity tool, pasted from the
+/// clipboard, or duplicated in place.
+pub fn spawn_entity(player: &Player, body: &[u8]) -> Result<(), String> {
+    let mut r = Reader::new(body);
+    let err = |e: crate::buf::Error| e.to_string();
+
+    struct Entry<'a> {
+        uuid: (u64, u64),
+        placement: Placement,
+        copy_from: Option<(u64, u64)>,
+        tag: &'a [u8],
+    }
+
+    let count = r.var_len("spawn list", MAX_COLLECTION).map_err(err)?;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        entries.push(Entry {
+            uuid: r.uuid().map_err(err)?,
+            placement: Placement {
+                position: (
+                    r.f64().map_err(err)?,
+                    r.f64().map_err(err)?,
+                    r.f64().map_err(err)?,
+                ),
+                yaw: r.f32().map_err(err)?,
+                pitch: r.f32().map_err(err)?,
+            },
+            copy_from: if r.bool().map_err(err)? {
+                Some(r.uuid().map_err(err)?)
+            } else {
+                None
+            },
+            tag: nbt::take_network_tag(&mut r).map_err(err)?,
+        });
+    }
+
+    if !has_perm(player, permissions::ENTITY_SPAWN) {
+        return Ok(());
+    }
+    let world = player.get_world();
+
+    // One sweep finds both the UUIDs already in use and the entities to copy.
+    let mut wanted: Vec<(u64, u64)> = entries.iter().map(|entry| entry.uuid).collect();
+    wanted.extend(entries.iter().filter_map(|entry| entry.copy_from));
+    let mut taken = vec![false; entries.len()];
+    let mut sources = Vec::new();
+    for (index, entity) in entities_by_uuid(&world, &wanted) {
+        match taken.get_mut(index) {
+            Some(slot) => *slot = true,
+            None => sources.push((wanted[index], entity)),
+        }
+    }
+
+    let mut spawned = 0_usize;
+    for (entry, taken) in entries.iter().zip(taken) {
+        if taken || !entry.placement.in_spawnable_bounds() {
+            continue;
+        }
+        let copied = entry
+            .copy_from
+            .and_then(|id| sources.iter().find(|(uuid, _)| *uuid == id))
+            .filter(|(_, source)| source.get_type() != EntityType::Player)
+            .map(|(_, source)| save_with_riders(source));
+
+        let mut fields = nbt::read_compound(entry.tag).map_err(err)?;
+        nbt::sanitize_entity(&mut fields).map_err(err)?;
+        if let Some(copied) = &copied {
+            // The copy is the server's own NBT, so it is not sanitized, and it
+            // wins over whatever the client sent alongside.
+            let mut copied = nbt::read_compound(copied).map_err(err)?;
+            copied.retain(|field| field.name != b"Dimension");
+            nbt::merge(&mut fields, copied).map_err(err)?;
+        }
+        if spawn_stack(&world, &entry.placement, entry.uuid, fields).is_some() {
+            spawned += 1;
+        }
+    }
+    tracing::debug!("Spawned {spawned} entities for {}", player.get_name());
+    Ok(())
+}
+
+/// Where a spawn request puts an entity, and everything riding it with it.
+struct Placement {
+    position: (f64, f64, f64),
+    yaw: f32,
+    pitch: f32,
+}
+
+impl Placement {
+    /// Vanilla's `Level.isInSpawnableBounds`, and finite, which it takes for
+    /// granted.
+    fn in_spawnable_bounds(&self) -> bool {
+        let (x, y, z) = self.position;
+        [x, y, z].iter().all(|v| v.is_finite())
+            && (-30_000_000.0..30_000_000.0).contains(&x.floor())
+            && (-30_000_000.0..30_000_000.0).contains(&z.floor())
+            && (-20_000_000.0..20_000_000.0).contains(&y.floor())
+    }
+}
+
+/// Spawns an entity and everything riding it, as vanilla's `loadEntityRecursive`
+/// does: the whole stack at the requested spot, and only the entity at the bottom
+/// under the UUID the client chose.
+fn spawn_stack(
+    world: &World,
+    placement: &Placement,
+    uuid: (u64, u64),
+    mut fields: Vec<nbt::Field<'_>>,
+) -> Option<Entity> {
+    // Pumpkin loads no riders from NBT, so they are spawned one by one.
+    let riders = fields
+        .iter()
+        .position(|field| field.name == b"Passengers")
+        .map(|index| fields.remove(index));
+    place(&mut fields, placement);
+
+    let entity = world.spawn_entity_from_nbt(
+        placement.position,
+        Uuid {
+            high: uuid.0,
+            low: uuid.1,
+        },
+        &nbt::write_compound(&fields),
+    )?;
+    let riders = riders.as_ref().map_or_else(Vec::new, |field| {
+        nbt::read_compound_list(&field.payload).unwrap_or_default()
+    });
+    for rider in riders {
+        let Some(id) = random_uuid() else { break };
+        if let Some(rider) = spawn_stack(world, placement, id, rider) {
+            entity.add_passenger(rider);
+        }
+    }
+    Some(entity)
+}
+
+/// Writes the requested position and rotation into an entity's NBT, turning an
+/// item frame or painting along with it.
+fn place(fields: &mut Vec<nbt::Field<'_>>, placement: &Placement) {
+    turn_hanging(fields, placement.yaw);
+    let (x, y, z) = placement.position;
+    nbt::put(fields, nbt::Field::list(b"Pos", nbt::doubles(&[x, y, z])));
+    nbt::put(
+        fields,
+        nbt::Field::list(b"Rotation", nbt::floats(&[placement.yaw, placement.pitch])),
+    );
+}
+
+/// Item frames and paintings face a block side, not a yaw, so upstream turns a
+/// change in yaw into quarter turns of that side — which is what makes them
+/// follow a rotated paste. A frame lying flat turns its item instead.
+fn turn_hanging(fields: &mut Vec<nbt::Field<'_>>, yaw: f32) {
+    // Item frames store a 3D direction under "Facing"; paintings a horizontal one
+    // (0 south, 1 west, 2 north, 3 east) under "facing".
+    let id = nbt::string(fields, b"id").map(|id| id.trim_start_matches("minecraft:"));
+    let (key, three_d): (&'static [u8], bool) = match id {
+        Some("item_frame" | "glow_item_frame") => (b"Facing", true),
+        Some("painting") => (b"facing", false),
+        _ => return,
+    };
+    // Missing, the facing loads as its default: down for a frame, south for a
+    // painting. Of the 3D values, 2 to 5 are north, south, west and east.
+    let stored = nbt::byte(fields, key).unwrap_or(0);
+    let horizontal = if three_d {
+        [None, None, Some(2), Some(0), Some(1), Some(3)]
+            .get(usize::from(stored))
+            .copied()
+            .flatten()
+    } else {
+        Some(stored & 3)
+    };
+
+    // The yaw vanilla gives the entity for the side it faces.
+    let changed = yaw - horizontal.map_or(0.0, |h| f32::from(h) * 90.0);
+    match horizontal {
+        Some(h) => {
+            let turned = (i32::from(h) + java_round(changed / 90.0)).rem_euclid(4) as usize;
+            let value = if three_d { [3, 4, 2, 5][turned] } else { turned as u8 };
+            nbt::put(fields, nbt::Field::byte(key, value));
+        }
+        None => {
+            let rotation = nbt::byte(fields, b"ItemRotation").unwrap_or(0) as i8;
+            let turned = (i32::from(rotation) - java_round(changed / 45.0)).rem_euclid(8);
+            nbt::put(fields, nbt::Field::byte(b"ItemRotation", turned as u8));
+        }
+    }
+}
+
+/// `Math.round`, which rounds halves up rather than away from zero.
+fn java_round(value: f32) -> i32 {
+    (value + 0.5).floor() as i32
+}
+
+/// An entity's NBT with its riders nested inside, the way vanilla's
+/// `saveAsPassenger` writes it — players, which vanilla never saves this way,
+/// left out. Pumpkin's own NBT leaves riders out entirely.
+fn save_with_riders(entity: &Entity) -> Vec<u8> {
+    let nbt = entity.get_nbt();
+    let riders: Vec<Vec<u8>> = entity
+        .get_passengers()
+        .iter()
+        .filter(|rider| rider.get_type() != EntityType::Player)
+        .map(save_with_riders)
+        .collect();
+    if riders.is_empty() {
+        return nbt;
+    }
+    let Ok(mut fields) = nbt::read_compound(&nbt) else {
+        return nbt;
+    };
+    nbt::put(&mut fields, nbt::Field::list(b"Passengers", nbt::compound_list(&riders)));
+    nbt::write_compound(&fields)
+}
+
+/// A random version 4 UUID, as vanilla gives every rider but the bottom one.
+fn random_uuid() -> Option<(u64, u64)> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let value = u128::from_be_bytes(bytes);
+    Some(((value >> 64) as u64, value as u64))
 }
 
 /// Blocks a single tick request may touch. Upstream lets these run to millions and
@@ -1061,4 +1338,62 @@ pub fn tick_blocks(player: &Player, body: &[u8]) -> Result<(), String> {
     }
     tracing::debug!("Ticked {} blocks for {}", positions.len(), player.get_name());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hanging(id: &str, key: &'static [u8], facing: u8) -> Vec<u8> {
+        let mut name = (id.len() as u16).to_be_bytes().to_vec();
+        name.extend_from_slice(id.as_bytes());
+        let mut fields = vec![nbt::Field {
+            tag: 8,
+            name: b"id",
+            payload: std::borrow::Cow::Owned(name),
+        }];
+        nbt::put(&mut fields, nbt::Field::byte(key, facing));
+        nbt::write_compound(&fields)
+    }
+
+    fn turned(tag: &[u8], yaw: f32, key: &[u8]) -> Option<u8> {
+        let mut fields = nbt::read_compound(tag).unwrap();
+        turn_hanging(&mut fields, yaw);
+        nbt::byte(&fields, key)
+    }
+
+    #[test]
+    fn hanging_entities_turn_with_the_paste() {
+        // A painting facing south (yaw 0) pasted at yaw 90 now faces west.
+        assert_eq!(turned(&hanging("minecraft:painting", b"facing", 0), 90.0, b"facing"), Some(1));
+        // An item frame facing north (yaw 180) pasted at yaw 270 now faces east.
+        assert_eq!(turned(&hanging("minecraft:item_frame", b"Facing", 2), 270.0, b"Facing"), Some(5));
+        // A painting with no facing at all starts from south, as it loads.
+        assert_eq!(turned(&hanging("painting", b"x", 0), 180.0, b"facing"), Some(2));
+        // A frame lying on the floor turns its item, an eighth per 45 degrees.
+        let flat = hanging("glow_item_frame", b"Facing", 1);
+        assert_eq!(turned(&flat, 90.0, b"ItemRotation"), Some(6));
+        assert_eq!(turned(&flat, 90.0, b"Facing"), Some(1), "the side it faces stays");
+    }
+
+    #[test]
+    fn rounding_matches_java() {
+        assert_eq!(java_round(-2.5), -2);
+        assert_eq!(java_round(2.5), 3);
+        assert_eq!(java_round(-0.4), 0);
+    }
+
+    #[test]
+    fn spawns_stay_inside_vanilla_bounds() {
+        let at = |x: f64, y: f64| Placement {
+            position: (x, y, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        assert!(at(0.0, 64.0).in_spawnable_bounds());
+        assert!(at(29_999_999.9, 64.0).in_spawnable_bounds());
+        assert!(!at(30_000_000.0, 64.0).in_spawnable_bounds());
+        assert!(!at(f64::NAN, 64.0).in_spawnable_bounds());
+        assert!(!at(0.0, f64::INFINITY).in_spawnable_bounds());
+    }
 }
