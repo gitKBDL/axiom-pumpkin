@@ -31,19 +31,27 @@ cp target/wasm32-wasip2/release/axiom_pumpkin.wasm /path/to/server/plugins/axiom
 
 ## Generated sources
 
-Two modules are generated and must not be edited by hand:
+Three modules are generated and must not be edited by hand:
 
 - `src/permissions.rs` — Axiom's permission nodes, from the upstream Java enum.
   `tools/gen_permissions.py ../axiom-java-reference > src/permissions.rs`
+- `src/block_remap.rs` and `assets/remap/` — block state id translation for
+  clients older than the server, from pumpkin-java-multiversion's remap tables.
+  `tools/gen_block_remap.py ../pumpkin-java-multiversion > src/block_remap.rs`
 - `src/biomes.rs` — biome lookup by registry name.
   `tools/gen_biomes.py ../pumpkin-src > src/biomes.rs`
 
 ## Client versions
 
-Axiom works for clients on the server's own Minecraft version, 26.3. Pumpkin
-lets older clients in only through a multi-version plugin, and their Axiom
-packets carry block ids from the older registry, where the same number names
-a different block — so Axiom stays off for them rather than corrupting builds.
+Pumpkin itself accepts only clients on its own version, 26.3. Older ones get in
+through [pumpkin-java-multiversion](https://github.com/Pumpkin-MC/pumpkin-java-multiversion),
+which remaps block state ids in the chunk data it relays but passes plugin
+messages through untouched — so an older client's Axiom packets arrive in *its*
+registry, where the same number means a different block. Ids are translated in
+both directions here, which is the job upstream delegates to ViaVersion.
+
+A client on a version with no translation table is refused rather than let
+loose on the world with ids that mean something else.
 
 ## Status
 

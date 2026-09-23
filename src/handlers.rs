@@ -12,6 +12,7 @@ use pumpkin_plugin_api::{
     world::{self, BlockFlags, Chunk, Entity, EntityType, World},
 };
 
+use crate::block_remap::{self, Tables};
 use crate::buf::{Reader, Writer, pack_block_pos, unpack_block_pos};
 use crate::biomes;
 use crate::nbt;
@@ -113,13 +114,51 @@ fn void_air() -> u16 {
     id
 }
 
-/// Checks an id off the wire against the server's registry.
+/// The id translation this client needs, if any.
 ///
-/// `None` means the id names no block here; callers treat that as "leave this
+/// Older clients reach Pumpkin through pumpkin-java-multiversion, which remaps
+/// block state ids in the chunk data it relays but passes plugin messages through
+/// untouched — so an older client's Axiom packets arrive in *its* registry, where
+/// the same number means a different block. Upstream leans on ViaVersion for
+/// exactly this.
+fn client_remap(player: &Player) -> Option<&'static Tables> {
+    player
+        .as_java()
+        .and_then(|java| block_remap::tables_for(java.get_version()))
+}
+
+/// Human-readable note about whether this client's block ids need translating.
+pub fn describe_client_registry(player: &Player) -> String {
+    let Some(java) = player.as_java() else {
+        return "not a Java client".to_owned();
+    };
+    let version = java.get_version();
+    if block_remap::tables_for(version).is_some() {
+        format!("client {version:?}, translating block ids to the server registry")
+    } else {
+        format!("client {version:?}, same block registry as the server")
+    }
+}
+
+/// Converts one id from the client's registry into the server's and checks it.
+///
+/// `None` means the id has no equivalent here; callers treat that as "leave this
 /// block alone", which is the only safe reading — guessing a replacement would
 /// silently rewrite the player's build.
-fn server_state(id: u16) -> Option<u16> {
+fn server_state(remap: Option<&'static Tables>, client_id: u16) -> Option<u16> {
+    let id = match remap {
+        Some(tables) => block_remap::to_server(tables.to_server, client_id)?,
+        None => client_id,
+    };
     (u32::from(id) < state_count()).then_some(id)
+}
+
+/// The reverse: one of our ids expressed in the client's registry.
+fn client_state(remap: Option<&'static Tables>, server_id: u16) -> Option<u16> {
+    match remap {
+        Some(tables) => block_remap::to_client(tables.to_client, server_id),
+        None => Some(server_id),
+    }
 }
 
 /// Flags matching Axiom's two placement modes.
@@ -191,8 +230,9 @@ pub fn set_block(player: &Player, body: &[u8]) -> Result<(), String> {
     }
 
     let world = player.get_world();
+    let remap = client_remap(player);
     for ((x, y, z), state) in blocks {
-        let Some(state) = u16::try_from(state).ok().and_then(server_state) else {
+        let Some(state) = u16::try_from(state).ok().and_then(|id| server_state(remap, id)) else {
             continue;
         };
         // Upstream skips neighbour updates for a block adjacent to any position the
@@ -224,7 +264,7 @@ fn describe(id: u16) -> String {
     )
 }
 
-fn diagnose_first_section(declared_bits: u8, entries: &[u16]) {
+fn diagnose_first_section(remap: Option<&'static Tables>, declared_bits: u8, entries: &[u16]) {
     if DIAGNOSED.swap(1, Ordering::Relaxed) != 0 {
         return;
     }
@@ -236,10 +276,16 @@ fn diagnose_first_section(declared_bits: u8, entries: &[u16]) {
         }
     }
     counts.sort_by(|a, b| b.1.cmp(&a.1));
+    // Report ids as the server sees them; the raw wire value is in the client's
+    // registry and naming it with our own table is how this looked like a
+    // turtle_egg problem the first time round.
     let top: Vec<String> = counts
         .iter()
         .take(3)
-        .map(|(id, n)| format!("{}×{n}", describe(*id)))
+        .map(|(id, n)| match server_state(remap, *id) {
+            Some(server) => format!("{}×{n}", describe(server)),
+            None => format!("{id} (no server equivalent)×{n}"),
+        })
         .collect();
 
     tracing::info!(
@@ -300,6 +346,7 @@ fn apply_block_buffer<'a>(
     }
 
     let empty = void_air();
+    let remap = client_remap(player);
     let direct = direct_bits();
     let flags = placement_flags(false);
     let allow_nbt = has_perm(player, permissions::BUILD_NBT);
@@ -315,7 +362,7 @@ fn apply_block_buffer<'a>(
         let (section_x, section_y, section_z) = unpack_block_pos(key);
         let declared_bits = r.peek_u8().map_err(err)?;
         let entries = palette::read_section(r, direct).map_err(err)?;
-        diagnose_first_section(declared_bits, &entries);
+        diagnose_first_section(remap, declared_bits, &entries);
 
         let count = r
             .var_len("block entities", MAX_BLOCK_ENTITIES)
@@ -345,7 +392,7 @@ fn apply_block_buffer<'a>(
         for y in 0..16 {
             for z in 0..16 {
                 for x in 0..16 {
-                    let Some(state) = server_state(entries[index_of(x, y, z)]) else {
+                    let Some(state) = server_state(remap, entries[index_of(x, y, z)]) else {
                         continue;
                     };
                     if state == empty {
@@ -599,6 +646,7 @@ pub fn request_chunk_data(player: &Player, body: &[u8]) -> Result<(), String> {
         return Ok(());
     }
 
+    let remap = client_remap(player);
     let started = std::time::Instant::now();
     let mut response = ChunkResponse::new(player, id);
 
@@ -635,7 +683,7 @@ pub fn request_chunk_data(player: &Player, body: &[u8]) -> Result<(), String> {
 
         let mut entry = Writer::new();
         entry.i64(key);
-        match section_for_client(&chunk, section_y) {
+        match section_for_client(&chunk, section_y, remap) {
             Some(entries) => {
                 entry.bool(true);
                 if !palette::write_section_indirect(&mut entry, &entries) {
@@ -728,18 +776,30 @@ fn apply_biome_buffer(player: &Player, r: &mut Reader<'_>, world_key: &str) -> R
     Ok(())
 }
 
-/// Reads one section out of a loaded chunk.
+/// Reads one section out of a loaded chunk and re-expresses it in the client's
+/// registry.
 ///
 /// Returns `None` for a section that is outside the world or entirely air; the
 /// response encodes that as "no data" rather than 4096 copies of air.
-fn section_for_client(chunk: &Chunk, section_y: i32) -> Option<Vec<u16>> {
+fn section_for_client(
+    chunk: &Chunk,
+    section_y: i32,
+    remap: Option<&'static Tables>,
+) -> Option<Vec<u16>> {
     // One host call for the whole section. Reading it block by block was 4096
     // calls and made a copy of any size stall the tick.
     let states = chunk.read_section(section_y)?;
     if states.len() != SECTION_VOLUME || states.iter().all(|&id| id == 0) {
         return None;
     }
-    Some(states)
+    Some(
+        states
+            .into_iter()
+            // An id the client has no name for is sent as air; showing the player
+            // a wrong block would be worse than showing a gap.
+            .map(|id| client_state(remap, id).unwrap_or(0))
+            .collect(),
+    )
 }
 
 /// Looks up the entities a packet named by UUID, in one sweep of the world.
@@ -1343,6 +1403,32 @@ pub fn tick_blocks(player: &Player, body: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_remap::{tables_for, to_client, to_server};
+    use pumpkin_plugin_api::player::JavaMinecraftVersion;
+
+    /// Regression: a 1.21.9 client calls `void_air` 15090 while the 26.3 server
+    /// calls it 18649. Reading that id literally made every block a buffer meant
+    /// to leave untouched get overwritten.
+    #[test]
+    fn older_client_ids_translate_to_the_server_registry() {
+        let tables = tables_for(JavaMinecraftVersion::V1219).expect("1.21.9 needs translation");
+        assert_eq!(to_server(tables.to_server, 15090), Some(18649), "void_air");
+        assert_eq!(to_server(tables.to_server, 1), Some(1), "stone is unchanged");
+        assert_eq!(to_server(tables.to_server, 0), Some(0), "air is unchanged");
+        // And back again, for ids we send to the client.
+        assert_eq!(to_client(tables.to_client, 18649), Some(15090), "void_air");
+        assert_eq!(to_client(tables.to_client, 1), Some(1), "stone is unchanged");
+
+        // 26.2 is one release behind, and its ids have already moved.
+        let tables = tables_for(JavaMinecraftVersion::V262).expect("26.2 needs translation");
+        assert_eq!(to_server(tables.to_server, 15292), Some(18649), "void_air");
+    }
+
+    /// A client on the server's own version must not be translated at all.
+    #[test]
+    fn current_version_needs_no_translation() {
+        assert!(tables_for(JavaMinecraftVersion::V263).is_none());
+    }
 
     fn hanging(id: &str, key: &'static [u8], facing: u8) -> Vec<u8> {
         let mut name = (id.len() as u16).to_be_bytes().to_vec();

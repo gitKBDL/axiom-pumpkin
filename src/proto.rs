@@ -24,9 +24,10 @@ const INFINITE_REACH_LIMIT: i32 = 256;
 /// topping it up — without that, only the first buffer of an edit ever arrives.
 const DISPATCH_SENDS_PER_SECOND: i32 = 1024;
 
-/// The newest version in the plugin API this is built against, and the only one
-/// Pumpkin accepts on its own. An older client gets in only through a multi-version
-/// plugin, and its Axiom packets would carry block ids from its own registry: the
+/// The newest version in the plugin API this is built against, whose block
+/// registry the server uses. Older clients get in through
+/// pumpkin-java-multiversion and have their block ids translated; one with no
+/// translation table would edit with ids that name different blocks here — the
 /// mismatch that once filled untouched blocks with turtle eggs.
 const SERVER_VERSION: JavaMinecraftVersion = JavaMinecraftVersion::V263;
 
@@ -372,11 +373,11 @@ fn handle_hello(player: &Player, body: &[u8]) -> Result<(), String> {
         send_goodbye(player, "Missing axiom.use permission");
         return Ok(());
     }
-    if player
-        .as_java()
-        .is_some_and(|java| java.get_version() != SERVER_VERSION)
-    {
-        send_goodbye(player, "Axiom needs the same Minecraft version as the server");
+    if player.as_java().is_some_and(|java| {
+        let version = java.get_version();
+        version != SERVER_VERSION && crate::block_remap::tables_for(version).is_none()
+    }) {
+        send_goodbye(player, "Axiom does not support this Minecraft version on this server");
         return Ok(());
     }
 
@@ -423,5 +424,6 @@ fn activate(player: &Player) {
     // finish opening its editor UI.
     send(player, "axiom:register_world_properties", &[0]);
 
-    tracing::info!("Axiom enabled for {}", player.get_name());
+    let translated = crate::handlers::describe_client_registry(player);
+    tracing::info!("Axiom enabled for {} ({translated})", player.get_name());
 }
