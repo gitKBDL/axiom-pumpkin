@@ -161,6 +161,23 @@ fn client_state(remap: Option<&'static Tables>, server_id: u16) -> Option<u16> {
     }
 }
 
+/// The chunks an edit has made sure are in memory.
+///
+/// A write to a chunk that is not loaded is dropped without a word, and nothing
+/// beyond the players' view distance is loaded — so pastes and copies out there
+/// silently did nothing. Upstream gets the same guarantee from `getChunk`, which
+/// loads on demand.
+#[derive(Default)]
+struct LoadedChunks(std::collections::HashSet<(i32, i32)>);
+
+impl LoadedChunks {
+    fn ensure(&mut self, world: &World, chunk_x: i32, chunk_z: i32) {
+        if self.0.insert((chunk_x, chunk_z)) {
+            world.load_chunk(chunk_x, chunk_z);
+        }
+    }
+}
+
 /// Flags matching Axiom's two placement modes.
 fn placement_flags(update_neighbors: bool) -> BlockFlags {
     if update_neighbors {
@@ -231,10 +248,12 @@ pub fn set_block(player: &Player, body: &[u8]) -> Result<(), String> {
 
     let world = player.get_world();
     let remap = client_remap(player);
+    let mut loaded = LoadedChunks::default();
     for ((x, y, z), state) in blocks {
         let Some(state) = u16::try_from(state).ok().and_then(|id| server_state(remap, id)) else {
             continue;
         };
+        loaded.ensure(&world, x >> 4, z >> 4);
         // Upstream skips neighbour updates for a block adjacent to any position the
         // client asked to leave alone, so a no-update placement cannot be undone by
         // its neighbour's update.
@@ -353,6 +372,7 @@ fn apply_block_buffer<'a>(
     let mut nbt_budget = MAX_BUFFER_NBT_BYTES;
     let mut sections = 0_usize;
     let mut changed = 0_usize;
+    let mut loaded = LoadedChunks::default();
 
     loop {
         let key = r.i64().map_err(err)?;
@@ -386,6 +406,7 @@ fn apply_block_buffer<'a>(
         }
         entities.sort_unstable_by_key(|entity| entity.offset);
 
+        loaded.ensure(&world, section_x, section_z);
         let base_x = section_x * 16;
         let base_y = section_y * 16;
         let base_z = section_z * 16;
@@ -650,12 +671,11 @@ pub fn request_chunk_data(player: &Player, body: &[u8]) -> Result<(), String> {
     let started = std::time::Instant::now();
     let mut response = ChunkResponse::new(player, id);
 
+    let mut loaded = LoadedChunks::default();
     if has_perm(player, permissions::CHUNK_REQUESTBLOCKENTITY) {
         for packed in entity_positions {
             let (x, y, z) = unpack_block_pos(packed);
-            if world.get_chunk(x >> 4, z >> 4).is_none() {
-                continue;
-            }
+            loaded.ensure(&world, x >> 4, z >> 4);
             let Some(nbt) = world.get_block_entity_nbt(BlockPos { x, y, z }) else {
                 continue;
             };
@@ -675,11 +695,7 @@ pub fn request_chunk_data(player: &Player, body: &[u8]) -> Result<(), String> {
     let mut served = 0_usize;
     for key in section_keys {
         let (section_x, section_y, section_z) = unpack_block_pos(key);
-        let Some(chunk) = world.get_chunk(section_x, section_z) else {
-            // Not loaded, and a plugin cannot force a load; the client keeps
-            // whatever it already had for this section.
-            continue;
-        };
+        let chunk = world.load_chunk(section_x, section_z);
 
         let mut entry = Writer::new();
         entry.i64(key);
@@ -742,6 +758,8 @@ fn apply_biome_buffer(player: &Player, r: &mut Reader<'_>, world_key: &str) -> R
     }
 
     let mut painted = 0_usize;
+    let mut changed_chunks = Vec::new();
+    let mut loaded = LoadedChunks::default();
     loop {
         let key = r.i64().map_err(err)?;
         if key == MIN_POSITION_LONG {
@@ -761,16 +779,23 @@ fn apply_biome_buffer(player: &Player, r: &mut Reader<'_>, world_key: &str) -> R
             // Cells are laid out with x fastest, then y, then z.
             let (x, y, z) = (index % 16, (index / 16) % 16, index / 256);
             // Key and index are in cell units; a cell covers four blocks per axis.
-            world.set_biome(
-                BlockPos {
-                    x: (block_x * 16 + x as i32) * 4,
-                    y: (block_y * 16 + y as i32) * 4,
-                    z: (block_z * 16 + z as i32) * 4,
-                },
-                *biome,
-            );
+            let pos = BlockPos {
+                x: (block_x * 16 + x as i32) * 4,
+                y: (block_y * 16 + y as i32) * 4,
+                z: (block_z * 16 + z as i32) * 4,
+            };
+            loaded.ensure(&world, pos.x >> 4, pos.z >> 4);
+            world.set_biome(pos, *biome);
+            changed_chunks.push((pos.x >> 4, pos.z >> 4));
             painted += 1;
         }
+    }
+    // Setting a biome tells nobody, so the painter would only show up once the
+    // chunk is sent again; upstream resends the biomes of every chunk it touched.
+    changed_chunks.sort_unstable();
+    changed_chunks.dedup();
+    if !changed_chunks.is_empty() {
+        world.refresh_biomes(&changed_chunks);
     }
     tracing::debug!("Painted {painted} biome cells for {}", player.get_name());
     Ok(())
